@@ -74,7 +74,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # F8: derive gated commit from the sibling checkout, do not trust CLI input.
+    # F8: derive gated commit from the gated-uat-pin worktree; do not trust CLI input.
     # verify_gated_dependency() enforces the exact pin and clean-tree invariant;
     # a mismatch raises RuntimeError (not a configuration error — a hard rejection).
     try:
@@ -84,7 +84,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 1
     if gated_commit is None:
         print(
-            "gated-uat: cannot derive gated commit — ensure ../gated is a valid git checkout",
+            "gated-uat: cannot derive gated commit — ensure gated-uat-pin worktree is set up",
             file=sys.stderr,
         )
         return 1
