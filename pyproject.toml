@@ -1,3 +1,7 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "gated-uat"
 version = "0.0.1"
@@ -7,8 +11,11 @@ dependencies = [
 ]
 # gated is a required dependency but is not yet published to PyPI.
 # Development layout: sibling checkout at ../gated added to PYTHONPATH via conftest.py.
-# Pinned commit: 96bebac (3.5 S2: packaging + mandatory-guard foundation, wire-neutral)
+# Pinned commit: 628e5a3 (3.5 S3 ckpt3: trust + guard policy provenance)
 # Production deploy-tier: install gated from the pinned artifact hash (§11, not built here).
+
+[project.scripts]
+gated-uat = "cli:main"
 
 [project.optional-dependencies]
 dev = [
@@ -21,8 +28,16 @@ dev = [
 strict = true
 ignore_missing_imports = true
 
+# gated's modules are an external pinned dependency — suppress unused-ignore warnings
+# that arise because nacl stubs are installed on this system but gated's code predates
+# their availability.  gated-uat does not control gated's source.
+[[tool.mypy.overrides]]
+module = ["gate.*", "engine.*", "sandbox.*", "core.*"]
+warn_unused_ignores = false
+
 [tool.ruff]
 line-length = 100
+exclude = ["corpora/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]

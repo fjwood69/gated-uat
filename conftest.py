@@ -1,61 +1,40 @@
 """conftest.py — gated sys.path injection, commit pin, and test helpers.
 
 Production: install gated from a pinned artifact hash (§11). Development: add
-the sibling checkout at ../gated. The pinned commit is asserted via git so a
-stale or dirty checkout fails loudly (error, not warning) rather than silently
-testing the wrong code.
+the sibling checkout at ../gated. The pinned commit and clean-tree invariant are
+enforced by orchestrator.gated_pin.verify_gated_dependency() — the same function
+the CLI calls — so pytest and the installed CLI share exactly one enforcement path.
 
-Pinned: 96bebac (gated 3.5 S2: packaging + mandatory-guard foundation, wire-neutral)
+Pinned: 628e5a3 (gated 3.5 S3 ckpt3: trust + guard policy provenance through CalibrationResult)
 canonical_digest API contract: core.chain.canonical_digest(domain, payload, *, version=int) -> str
 """
+
 from __future__ import annotations
 
 import copy
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from nacl.signing import SigningKey
 
-_GATED_DEV = Path(__file__).parent.parent / "gated"
-_PINNED_COMMIT_PREFIX = "96bebac"
+# Dedicated pin worktree — never reuse /home/nucadmin/gated (the live step-3.5-jobs
+# checkout).  One-time setup: run
+#   git -C /home/nucadmin/gated worktree add --detach /home/nucadmin/gated-uat-pin \
+#       628e5a3d8274a74bb74cecaf7667fdf989398ebd
+# then leave it in place.
+_GATED_DEV = Path(__file__).parent.parent / "gated-uat-pin"
 
 if _GATED_DEV.is_dir():
     if str(_GATED_DEV) not in sys.path:
         sys.path.insert(0, str(_GATED_DEV))
 
-    # Assert gated is at the exact pinned commit — fail the session if not.
-    result = subprocess.run(
-        ["git", "rev-parse", "--short=7", "HEAD"],
-        cwd=_GATED_DEV,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Could not verify gated commit: {result.stderr.strip()}"
-        )
-    actual = result.stdout.strip()
-    if actual != _PINNED_COMMIT_PREFIX:
-        raise RuntimeError(
-            f"gated checkout is at {actual!r}, expected pinned commit "
-            f"{_PINNED_COMMIT_PREFIX!r} — evidence-bearing tests require the exact commit"
-        )
+    # Shared enforcement: exact-pin + clean-tree; raises RuntimeError on mismatch.
+    # The adapter imports gate/engine modules from the worktree at runtime, so a
+    # dirty or mismatched tree silently executes different bytes than 628e5a3.
+    from orchestrator.gated_pin import verify_gated_dependency
 
-    # Assert no tracked modifications — untracked files are ignored because they
-    # don't affect the evidence-bearing code paths.
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=no"],
-        cwd=_GATED_DEV,
-        capture_output=True,
-        text=True,
-    )
-    if dirty.returncode == 0 and dirty.stdout.strip():
-        raise RuntimeError(
-            f"gated checkout has uncommitted tracked changes — "
-            f"evidence-bearing tests require a clean tree:\n{dirty.stdout}"
-        )
+    verify_gated_dependency(_GATED_DEV)
 
 
 # ------------------------------------------------------------------

@@ -16,6 +16,7 @@ Key persistence:
   then fsync'd. Load-time checks refuse non-0600 or non-file paths.
   The verify key is derived on load (never stored separately).
 """
+
 from __future__ import annotations
 
 import json
