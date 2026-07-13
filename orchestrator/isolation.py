@@ -14,6 +14,7 @@ For resource-safe slugs: use run_id_slug(run_id) — strips dashes, prepends
 Cross-host safety in P2+: GitHub repo-name uniqueness is a second layer (§6,
 §5.2); a networked registry is the named deploy-tier (§11, not built here).
 """
+
 from __future__ import annotations
 
 import platform
@@ -138,9 +139,7 @@ class Registry:
             current = RunState(row[0])
             if current in _TERMINAL_STATES:
                 conn.execute("ROLLBACK")
-                raise RunStateError(
-                    f"run_id {run_id!r} is already in terminal state {current!r}"
-                )
+                raise RunStateError(f"run_id {run_id!r} is already in terminal state {current!r}")
             conn.execute(
                 "UPDATE run_registry SET state = ? WHERE run_id = ?",
                 (state.value, run_id),

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "gated_source_repo": "fjwood69/gated",
+  "gated_pinned_commit": "628e5a3",
+  "detector_id": "RetryCheck",
+  "detector_entrypoint": ["python3", "/artifact/main.py"],
+  "fixtures": [
+    {
+      "fixture_id": "retry-good-v1",
+      "label": "KNOWN_GOOD",
+      "evasion_class": null,
+      "payload_digest": "sha256:0e6db07b77d583e109924846c4807e8d9dde617c39b0c269d7db7b91f523ff4d",
+      "source_file": "tests/test_retry_engine.py",
+      "source_symbol": "_A",
+      "description": "Genuine retry loop: 3 attempts with try/except OSError, breaks on success. RetryCheck MUST pass this."
+    },
+    {
+      "fixture_id": "retry-swallow-v1",
+      "label": "KNOWN_BAD",
+      "evasion_class": "exception-swallowing",
+      "payload_digest": "sha256:2227080854205e225adb649faaaeab0662570ac2be30a78bc6ed6eb06a8ab0fc",
+      "source_file": "tests/test_retry_engine.py",
+      "source_symbol": "_B",
+      "description": "Swallowing helper: catches OSError and returns a truthy sentinel, so the loop stops at 1 attempt. Looks like a retry but the boundary sees 1 egress. RetryCheck MUST catch this."
+    },
+    {
+      "fixture_id": "retry-no-retry-v1",
+      "label": "KNOWN_BAD",
+      "evasion_class": "no-retry",
+      "payload_digest": "sha256:f3aa66f503929b403783964e8a670901ef724643282792f1302ec501f1eed02d",
+      "source_file": "tests/test_retry_engine.py",
+      "source_symbol": "_C",
+      "description": "Single attempt, no retry. Boundary sees exactly 1 egress. RetryCheck MUST catch this."
+    }
+  ]
+}

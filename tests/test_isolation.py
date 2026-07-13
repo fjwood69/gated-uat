@@ -3,6 +3,7 @@
 Phase 0 acceptance: two processes on the same filesystem racing to allocate
 the same run_id serialize — one wins, one raises AllocationError.
 """
+
 from __future__ import annotations
 
 import multiprocessing
@@ -171,7 +172,7 @@ class TestRegistry(unittest.TestCase):
         reg = self._reg()
         rid = reg.allocate()
         with self.assertRaises(ValueError):
-            reg.release(rid, state=RunState.ACTIVE)  # type: ignore[arg-type]
+            reg.release(rid, state=RunState.ACTIVE)
 
     def test_unknown_run_id_not_active(self) -> None:
         reg = self._reg()

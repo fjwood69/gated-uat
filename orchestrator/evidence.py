@@ -45,6 +45,7 @@ Evidence continuity (§P0-closure):
   (cross-reference checks 7a/7b in verify_integrity). Defence in depth: a
   receipt constructed outside the normal builders still fails at verify.
 """
+
 from __future__ import annotations
 
 import copy
@@ -57,7 +58,12 @@ from nacl.encoding import HexEncoder
 from nacl.signing import SigningKey, VerifyKey
 
 from .isolation import validate_run_id
-from .schemas import SIGNER_ROLE, SchemaViolationError, validate_payload
+from .schemas import (
+    SCHEMA_VERSION_MIN_ADMIT,
+    SIGNER_ROLE,
+    SchemaViolationError,
+    validate_payload,
+)
 from .trust import BadSignatureError, sign_receipt, verify_receipt_sig
 
 EVIDENCE_CHAIN_VERSION = 1
@@ -102,11 +108,11 @@ class SemanticContinuityError(ChainVerificationError):
 
 @dataclass(frozen=True)
 class Receipt:
-    kind: str             # prereg | execution | teardown | index
+    kind: str  # prereg | execution | teardown | index
     run_id: str
-    payload: dict[str, Any]   # deep-copied on construction; see build_receipt
-    digest: str           # canonical_digest of the receipt envelope (v1)
-    signature: str        # hex Ed25519 signature (trust.py sign_receipt)
+    payload: dict[str, Any]  # deep-copied on construction; see build_receipt
+    digest: str  # canonical_digest of the receipt envelope (v1)
+    signature: str  # hex Ed25519 signature (trust.py sign_receipt)
 
 
 # ------------------------------------------------------------------
@@ -156,9 +162,7 @@ class VerifiedChain:
 # ------------------------------------------------------------------
 
 
-def canonical_envelope(
-    kind: str, run_id: str, payload: dict[str, Any]
-) -> dict[str, Any]:
+def canonical_envelope(kind: str, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Build the canonical envelope for digest/signature computation.
 
     This is the wire-format contract — public so third-party verifiers and
@@ -252,7 +256,7 @@ def build_index(
 ) -> Receipt:
     """Build and sign the index receipt, referencing the three prior receipts by digest."""
     payload: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": prereg.payload.get("schema_version", 1),
         "prereg": prereg.digest,
         "execution": execution.digest,
         "teardown": teardown.digest,
@@ -315,7 +319,8 @@ def verify_integrity(
     1. No link is missing (MissingLinkError).
     2. Each receipt is in the expected position (kind matches position).
     3. All receipts share the same run_id.
-    4–6. Per-receipt: digest recompute, signature, schema.
+    4. All receipts share the same schema_version (homogeneous chain).
+    5–6. Per-receipt: digest recompute, signature, schema.
     7a. Evidence continuity: execution.prereg_digest == prereg.digest.
     7b. Evidence continuity: teardown.execution_digest == execution.digest.
     7c. Index cross-references match the actual prior receipt digests.
@@ -345,15 +350,21 @@ def verify_integrity(
     # 3. run_id consistency.
     run_ids = {r.run_id for r in (prereg, execution, teardown, index)}
     if len(run_ids) != 1:
+        raise ChainVerificationError(f"Receipts have inconsistent run_ids: {run_ids!r}")
+
+    # 4. Homogeneous schema_version across the chain.
+    versions = {r.payload.get("schema_version") for r in (prereg, execution, teardown, index)}
+    if len(versions) != 1:
         raise ChainVerificationError(
-            f"Receipts have inconsistent run_ids: {run_ids!r}"
+            f"Chain receipts have mixed schema_version values: {sorted(str(v) for v in versions)}"
         )
 
-    # 4–6. Per-receipt: digest recompute, signature, schema.
+    # 5–6. Per-receipt: digest recompute, signature, schema.
     for receipt in (prereg, execution, teardown, index):
         _verify_one(receipt, verify_key)
 
     # 7a. Evidence continuity: execution must bind prereg.
+    # (checks 7a/7b run after per-receipt schema)
     exec_prereg_digest = execution.payload.get("prereg_digest", "")
     if exec_prereg_digest != prereg.digest:
         raise ChainVerificationError(
@@ -414,9 +425,7 @@ def _verify_one(receipt: Receipt, verify_key: VerifyKey) -> None:
             version=CANONICAL_DIGEST_VERSION,
         )
     except Exception as exc:
-        raise ChainVerificationError(
-            f"Receipt {receipt.kind!r}: error recomputing digest"
-        ) from exc
+        raise ChainVerificationError(f"Receipt {receipt.kind!r}: error recomputing digest") from exc
 
     if receipt.digest != expected:
         raise ChainVerificationError(
@@ -427,9 +436,7 @@ def _verify_one(receipt: Receipt, verify_key: VerifyKey) -> None:
     try:
         verify_receipt_sig(receipt.kind, receipt.digest, receipt.signature, verify_key)
     except BadSignatureError as exc:
-        raise ChainVerificationError(
-            f"Receipt {receipt.kind!r} signature invalid"
-        ) from exc
+        raise ChainVerificationError(f"Receipt {receipt.kind!r} signature invalid") from exc
     except (ValueError, Exception) as exc:
         raise ChainVerificationError(
             f"Receipt {receipt.kind!r}: malformed signature or digest hex"
@@ -438,9 +445,7 @@ def _verify_one(receipt: Receipt, verify_key: VerifyKey) -> None:
     try:
         validate_payload(receipt.kind, receipt.payload)
     except SchemaViolationError as exc:
-        raise ChainVerificationError(
-            f"Receipt {receipt.kind!r} schema violation: {exc}"
-        ) from exc
+        raise ChainVerificationError(f"Receipt {receipt.kind!r} schema violation: {exc}") from exc
 
 
 # ------------------------------------------------------------------
@@ -465,6 +470,9 @@ def evaluate_admission(chain: VerifiedChain) -> bool:
     Non-admissible chains should be logged rather than discarded; they are
     still cryptographically valid records of what happened.
     """
+    schema_ver = chain.execution.payload.get("schema_version", 0)
+    if not isinstance(schema_ver, int) or schema_ver < SCHEMA_VERSION_MIN_ADMIT:
+        return False
     teardown_clean = not bool(chain.teardown.payload.get("failure", True))
     execution_outcome = chain.execution.payload.get("outcome", "error")
     return teardown_clean and execution_outcome in ("pass", "fail")

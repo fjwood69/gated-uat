@@ -1,4 +1,5 @@
 """tests/test_runtime.py — RuntimePack stub (§P0-closure, Phase 0)."""
+
 from __future__ import annotations
 
 import unittest
@@ -11,7 +12,7 @@ from orchestrator.runtime import (
 )
 
 
-def _pack(**kwargs: str) -> RuntimePack:  # type: ignore[type-arg]
+def _pack(**kwargs: str) -> RuntimePack:
     defaults = {
         "runtime_id": "python-3.11-test",
         "version": "0.0.1-dev",
