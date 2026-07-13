@@ -1,0 +1,10 @@
+RUNS/
+__pycache__/
+*.pyc
+*.pyo
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
