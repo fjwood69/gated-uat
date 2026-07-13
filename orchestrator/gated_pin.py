@@ -53,12 +53,15 @@ def verify_gated_dependency(gated_dir: Path) -> str:
     # --untracked-files=no is intentionally absent: an untracked .py module can
     # shadow evidence-bearing imports when gated_dir is on sys.path.
     # git status failure (nonzero) is a hard error — do not treat as clean.
-    dirty = subprocess.run(
-        ["git", "status", "--porcelain"],
-        cwd=gated_dir,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=gated_dir,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Could not inspect gated working tree: {exc}") from exc
     if dirty.returncode != 0:
         raise RuntimeError(
             f"Could not inspect gated working tree: {dirty.stderr.strip()}"
