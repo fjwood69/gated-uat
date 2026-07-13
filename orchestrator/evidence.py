@@ -9,9 +9,9 @@ INTEGRITY vs ADMISSION are separate concerns:
   verify_integrity(chain, verify_key) -> VerifiedChain
       Cryptographic + structural validity: signatures, digest matches, kind
       positions, run_id consistency, trust-anchor check, schema completeness,
-      semantic continuity (§P1-2). Returns a VerifiedChain on success.
-      A chain with teardown.failure=True still passes integrity — it is a
-      valid signed record of what happened.
+      semantic continuity (§P1-2), evidence continuity (§P0-closure). Returns
+      a VerifiedChain on success. A chain with teardown.failure=True still
+      passes integrity — it is a valid signed record of what happened.
 
   evaluate_admission(chain: VerifiedChain) -> bool
       Evidence admissibility: was the run clean enough to be counted?
@@ -31,10 +31,24 @@ Canonicalizer version (§P1-1):
   imported from core.chain — if gated bumps its constant, evidence-chain v1
   is unaffected. The version is recorded in execution receipts; a future
   evidence-chain version must define a new local literal.
+
+VerifiedChain integrity seal (§P0-closure):
+  _VERIFIED_SENTINEL is a module-private object. VerifiedChain.__post_init__
+  raises TypeError unless the sentinel is passed — only verify_integrity()
+  holds it. This proves, at the type level, that integrity was verified before
+  evaluate_admission() is called.
+
+Evidence continuity (§P0-closure):
+  execution.payload["prereg_digest"] must equal prereg.digest.
+  teardown.payload["execution_digest"] must equal execution.digest.
+  Enforced both at BUILD TIME (via asymmetric builders) and at VERIFY TIME
+  (cross-reference checks 7a/7b in verify_integrity). Defence in depth: a
+  receipt constructed outside the normal builders still fails at verify.
 """
 from __future__ import annotations
 
 import copy
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +56,7 @@ from core.chain import canonical_digest
 from nacl.encoding import HexEncoder
 from nacl.signing import SigningKey, VerifyKey
 
+from .isolation import validate_run_id
 from .schemas import SIGNER_ROLE, SchemaViolationError, validate_payload
 from .trust import BadSignatureError, sign_receipt, verify_receipt_sig
 
@@ -56,6 +71,11 @@ DOMAIN_PREFIX = "gated-uat-evidence"
 
 # The expected receipt kinds in chain order (position is validated).
 _CHAIN_ORDER = ("prereg", "execution", "teardown", "index")
+
+# Module-private sentinel: only verify_integrity() holds a reference.
+# VerifiedChain.__post_init__ rejects construction without this sentinel,
+# proving integrity was verified before evaluate_admission() is called.
+_VERIFIED_SENTINEL = object()
 
 
 # ------------------------------------------------------------------
@@ -90,7 +110,7 @@ class Receipt:
 
 
 # ------------------------------------------------------------------
-# VerifiedChain — proof that verify_integrity passed (§P1-4)
+# VerifiedChain — proof that verify_integrity passed (§P1-4, §P0-closure)
 # ------------------------------------------------------------------
 
 
@@ -100,6 +120,10 @@ class VerifiedChain:
 
     evaluate_admission() accepts only this type, ensuring callers cannot
     skip integrity verification before checking admissibility.
+
+    Construction is sealed: __post_init__ raises TypeError unless the
+    module-private _VERIFIED_SENTINEL is passed. Only verify_integrity()
+    holds the sentinel, so external callers cannot forge a VerifiedChain.
 
     verify_key_hex stores the trusted verifying key as a stable, hashable,
     serialisable hex string rather than a nacl VerifyKey object (which is
@@ -111,6 +135,15 @@ class VerifiedChain:
     teardown: Receipt
     index: Receipt
     verify_key_hex: str  # hex Ed25519 key that verified this chain
+    # InitVar: passed to __post_init__ but NOT stored as an attribute.
+    _sentinel: dataclasses.InitVar[object | None] = None
+
+    def __post_init__(self, _sentinel: object | None) -> None:
+        if _sentinel is not _VERIFIED_SENTINEL:
+            raise TypeError(
+                "VerifiedChain must be constructed via verify_integrity(), not directly. "
+                "External construction bypasses integrity verification."
+            )
 
     @property
     def is_admitted(self) -> bool:
@@ -152,10 +185,12 @@ def build_receipt(
 ) -> Receipt:
     """Build and sign a single receipt.
 
-    Validates the payload schema before signing — an incomplete payload is
-    rejected here, not on verification. The payload is deep-copied so caller
-    mutations after construction do not affect the signed evidence.
+    Validates UUID4 format of run_id and payload schema before signing.
+    An invalid run_id or incomplete payload is rejected here, not on
+    verification. The payload is deep-copied so caller mutations after
+    construction do not affect the signed evidence.
     """
+    validate_run_id(run_id)
     validate_payload(kind, payload)
     safe_payload: dict[str, Any] = copy.deepcopy(payload)
     domain = f"{DOMAIN_PREFIX}-{kind}"
@@ -166,6 +201,45 @@ def build_receipt(
     )
     sig = sign_receipt(kind, digest, signing_key)
     return Receipt(kind=kind, run_id=run_id, payload=safe_payload, digest=digest, signature=sig)
+
+
+def build_execution_receipt(
+    prereg: Receipt,
+    payload: dict[str, Any],
+    signing_key: SigningKey,
+) -> Receipt:
+    """Build and sign an execution receipt bound to a specific preregistration.
+
+    Injects ``prereg_digest`` from *prereg.digest* into the payload before
+    signing. Any caller-supplied ``prereg_digest`` is overwritten so the
+    binding is always derived from the actual receipt, not asserted by the
+    caller.
+
+    Uses *prereg.run_id* as the run_id — execution and prereg must share
+    the same run.
+    """
+    safe_payload: dict[str, Any] = copy.deepcopy(payload)
+    safe_payload["prereg_digest"] = prereg.digest
+    return build_receipt("execution", prereg.run_id, safe_payload, signing_key)
+
+
+def build_teardown_receipt(
+    execution: Receipt,
+    payload: dict[str, Any],
+    signing_key: SigningKey,
+) -> Receipt:
+    """Build and sign a teardown receipt bound to a specific execution.
+
+    Injects ``execution_digest`` from *execution.digest* into the payload
+    before signing. Any caller-supplied ``execution_digest`` is overwritten
+    so the binding is always derived from the actual receipt.
+
+    Uses *execution.run_id* as the run_id — teardown and execution must
+    share the same run.
+    """
+    safe_payload: dict[str, Any] = copy.deepcopy(payload)
+    safe_payload["execution_digest"] = execution.digest
+    return build_receipt("teardown", execution.run_id, safe_payload, signing_key)
 
 
 def build_index(
@@ -242,7 +316,9 @@ def verify_integrity(
     2. Each receipt is in the expected position (kind matches position).
     3. All receipts share the same run_id.
     4–6. Per-receipt: digest recompute, signature, schema.
-    7. Index cross-references match the actual prior receipt digests.
+    7a. Evidence continuity: execution.prereg_digest == prereg.digest.
+    7b. Evidence continuity: teardown.execution_digest == execution.digest.
+    7c. Index cross-references match the actual prior receipt digests.
     8. Trust anchor: index.verify_key_hex encodes the same key as *verify_key*.
     9. Semantic continuity: identical profile, consistent gated_commit.
 
@@ -277,7 +353,23 @@ def verify_integrity(
     for receipt in (prereg, execution, teardown, index):
         _verify_one(receipt, verify_key)
 
-    # 7. Index cross-references.
+    # 7a. Evidence continuity: execution must bind prereg.
+    exec_prereg_digest = execution.payload.get("prereg_digest", "")
+    if exec_prereg_digest != prereg.digest:
+        raise ChainVerificationError(
+            f"execution.prereg_digest {exec_prereg_digest!r} does not match "
+            f"prereg.digest {prereg.digest!r}"
+        )
+
+    # 7b. Evidence continuity: teardown must bind execution.
+    td_exec_digest = teardown.payload.get("execution_digest", "")
+    if td_exec_digest != execution.digest:
+        raise ChainVerificationError(
+            f"teardown.execution_digest {td_exec_digest!r} does not match "
+            f"execution.digest {execution.digest!r}"
+        )
+
+    # 7c. Index cross-references.
     for name, receipt in (
         ("prereg", prereg),
         ("execution", execution),
@@ -308,6 +400,7 @@ def verify_integrity(
         teardown=teardown,
         index=index,
         verify_key_hex=trusted_hex,
+        _sentinel=_VERIFIED_SENTINEL,
     )
 
 

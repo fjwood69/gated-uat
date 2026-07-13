@@ -128,7 +128,7 @@ class Registry:
 
         conn = self._connect()
         try:
-            conn.execute("BEGIN")
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT state FROM run_registry WHERE run_id = ?", (run_id,)
             ).fetchone()

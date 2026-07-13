@@ -5,7 +5,7 @@ the sibling checkout at ../gated. The pinned commit is asserted via git so a
 stale or dirty checkout fails loudly (error, not warning) rather than silently
 testing the wrong code.
 
-Pinned: 07d2161 (gated 3.5: P1-3 remediation — measurement-derived identity)
+Pinned: 96bebac (gated 3.5 S2: packaging + mandatory-guard foundation, wire-neutral)
 canonical_digest API contract: core.chain.canonical_digest(domain, payload, *, version=int) -> str
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ from typing import Any
 from nacl.signing import SigningKey
 
 _GATED_DEV = Path(__file__).parent.parent / "gated"
-_PINNED_COMMIT_PREFIX = "07d2161"
+_PINNED_COMMIT_PREFIX = "96bebac"
 
 if _GATED_DEV.is_dir():
     if str(_GATED_DEV) not in sys.path:

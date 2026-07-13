@@ -6,6 +6,15 @@ is the admission gate that rejects it independently.
 
 Schema version 1 is frozen here. Bump SCHEMA_VERSION for any change and
 provide a migration path — old receipts should remain verifiable.
+
+Phase-0 closure strictness rules:
+  - Integer fields reject booleans (bool is a subclass of int; excluded explicitly).
+  - ISO timestamps must include a timezone offset (Z or ±HH:MM) and no trailing text.
+  - Exact key sets: unknown keys are rejected so no field is silently ignored.
+  - Evidence continuity: execution payloads must include prereg_digest (hex64);
+    teardown payloads must include execution_digest (hex64).
+  - runtime_pack_digest is optional in Phase 0 (required from Phase 1+); when
+    present it must be a 64-char lowercase hex string.
 """
 from __future__ import annotations
 
@@ -18,7 +27,30 @@ VALID_OUTCOMES: frozenset[str] = frozenset({"pass", "fail", "error"})
 SIGNER_ROLE = "EvidenceSigner"
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
-_ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+# Require timezone (Z or ±HH:MM); reject trailing garbage with the $ anchor.
+_ISO_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+# Exact allowed key sets for each payload kind (schema v1).
+_PREREG_KEYS: frozenset[str] = frozenset({
+    "schema_version", "profile", "gated_commit", "corpus_version", "preregistered_at",
+})
+_EXECUTION_KEYS: frozenset[str] = frozenset({
+    "schema_version", "profile", "gated_commit", "outcome", "executed_at",
+    "canonical_digest_alg", "canonical_digest_version",
+    "prereg_digest",        # required: binds this receipt to its preregistration
+    "runtime_pack_digest",  # optional in Phase 0; required from Phase 1+
+})
+_TEARDOWN_KEYS: frozenset[str] = frozenset({
+    "schema_version", "profile", "failure", "torn_down_at",
+    "error",                # conditional: required when failure=True
+    "execution_digest",     # required: binds this receipt to its execution
+    "runtime_pack_digest",  # optional in Phase 0; required from Phase 1+
+})
+_INDEX_KEYS: frozenset[str] = frozenset({
+    "schema_version", "prereg", "execution", "teardown", "verify_key_hex", "signer_role",
+})
 
 
 class SchemaViolationError(ValueError):
@@ -37,6 +69,9 @@ def _require(payload: dict[str, Any], key: str, *, types: tuple[type, ...]) -> A
         raise SchemaViolationError(
             f"Field {key!r}: expected {types}, got {type(value).__name__}"
         )
+    # bool is a subclass of int; reject booleans when an integer is expected.
+    if int in types and isinstance(value, bool):
+        raise SchemaViolationError(f"Field {key!r}: expected int, got bool")
     return value
 
 
@@ -53,17 +88,29 @@ def _require_iso_timestamp(payload: dict[str, Any], key: str) -> str:
     value = _require(payload, key, types=(str,))
     if not _ISO_RE.match(value):
         raise SchemaViolationError(
-            f"Field {key!r}: must be an ISO timestamp, got {value!r}"
+            f"Field {key!r}: must be an ISO timestamp with timezone "
+            f"(e.g. '...Z' or '...+HH:MM'), got {value!r}"
         )
     return str(value)
+
+
+def _check_unknown_keys(
+    payload: dict[str, Any], allowed: frozenset[str], kind: str
+) -> None:
+    unknown = set(payload.keys()) - allowed
+    if unknown:
+        raise SchemaViolationError(
+            f"{kind!r} payload has unknown keys: {sorted(unknown)}"
+        )
 
 
 def validate_prereg_payload(payload: dict[str, Any]) -> None:
     """Validate a preregistration receipt payload (schema v1).
 
-    Required provenance: schema_version, profile, gated_commit,
-    corpus_version, preregistered_at.
+    Required: schema_version, profile, gated_commit, corpus_version, preregistered_at.
     """
+    _check_unknown_keys(payload, _PREREG_KEYS, "prereg")
+
     sv = _require(payload, "schema_version", types=(int,))
     if sv != SCHEMA_VERSION:
         raise SchemaViolationError(f"schema_version: expected {SCHEMA_VERSION}, got {sv}")
@@ -88,9 +135,12 @@ def validate_prereg_payload(payload: dict[str, Any]) -> None:
 def validate_execution_payload(payload: dict[str, Any]) -> None:
     """Validate an execution receipt payload (schema v1).
 
-    Required provenance: schema_version, profile, gated_commit, outcome,
-    executed_at, canonical_digest_alg, canonical_digest_version.
+    Required: schema_version, profile, gated_commit, outcome, executed_at,
+    canonical_digest_alg, canonical_digest_version, prereg_digest.
+    Optional: runtime_pack_digest (required from Phase 1+).
     """
+    _check_unknown_keys(payload, _EXECUTION_KEYS, "execution")
+
     sv = _require(payload, "schema_version", types=(int,))
     if sv != SCHEMA_VERSION:
         raise SchemaViolationError(f"schema_version: expected {SCHEMA_VERSION}, got {sv}")
@@ -121,13 +171,21 @@ def validate_execution_payload(payload: dict[str, Any]) -> None:
     if cdv != 1:
         raise SchemaViolationError(f"canonical_digest_version: must be exactly 1, got {cdv}")
 
+    _require_hex64(payload, "prereg_digest")
+
+    if "runtime_pack_digest" in payload:
+        _require_hex64(payload, "runtime_pack_digest")
+
 
 def validate_teardown_payload(payload: dict[str, Any]) -> None:
     """Validate a teardown receipt payload (schema v1).
 
-    Required provenance: schema_version, profile, failure, torn_down_at.
+    Required: schema_version, profile, failure, torn_down_at, execution_digest.
     When failure=True, error must be present and non-empty.
+    Optional: runtime_pack_digest (required from Phase 1+).
     """
+    _check_unknown_keys(payload, _TEARDOWN_KEYS, "teardown")
+
     sv = _require(payload, "schema_version", types=(int,))
     if sv != SCHEMA_VERSION:
         raise SchemaViolationError(f"schema_version: expected {SCHEMA_VERSION}, got {sv}")
@@ -142,6 +200,11 @@ def validate_teardown_payload(payload: dict[str, Any]) -> None:
 
     _require_iso_timestamp(payload, "torn_down_at")
 
+    _require_hex64(payload, "execution_digest")
+
+    if "runtime_pack_digest" in payload:
+        _require_hex64(payload, "runtime_pack_digest")
+
     if failure:
         if "error" not in payload:
             raise SchemaViolationError("failure=True requires 'error' field")
@@ -153,9 +216,11 @@ def validate_teardown_payload(payload: dict[str, Any]) -> None:
 def validate_index_payload(payload: dict[str, Any]) -> None:
     """Validate an index receipt payload (schema v1).
 
-    Required provenance: schema_version, prereg/execution/teardown digests,
+    Required: schema_version, prereg/execution/teardown digests,
     verify_key_hex (64-char Ed25519 public key hex), signer_role.
     """
+    _check_unknown_keys(payload, _INDEX_KEYS, "index")
+
     sv = _require(payload, "schema_version", types=(int,))
     if sv != SCHEMA_VERSION:
         raise SchemaViolationError(f"schema_version: expected {SCHEMA_VERSION}, got {sv}")

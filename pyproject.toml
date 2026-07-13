@@ -7,7 +7,7 @@ dependencies = [
 ]
 # gated is a required dependency but is not yet published to PyPI.
 # Development layout: sibling checkout at ../gated added to PYTHONPATH via conftest.py.
-# Pinned commit: 07d2161 (3.5: P1-3 remediation — measurement-derived identity + frozen execution)
+# Pinned commit: 96bebac (3.5 S2: packaging + mandatory-guard foundation, wire-neutral)
 # Production deploy-tier: install gated from the pinned artifact hash (§11, not built here).
 
 [project.optional-dependencies]
