@@ -11,9 +11,12 @@ Coverage:
   - Chain topology (P0-3): kind in wrong position, run_id mismatch, index
     verify_key_hex != trusted key.
   - Schema completeness (P0-2): incomplete payloads are rejected at build and
-    at verify (schema and signature are independent gates).
-  - Admission vs integrity (P1-2): teardown.failure=True verifies but is not
-    admitted; error outcome is not admitted.
+    at verify — schema validation fires independently of signature verification.
+  - Semantic continuity (P1-2): profile mismatch and gated_commit mismatch
+    across receipts are rejected; helper is testable in isolation.
+  - Admission vs integrity (P1-4): evaluate_admission accepts only VerifiedChain;
+    teardown.failure=True verifies but is not admitted; error outcome is not
+    admitted; a gated "fail" IS admissible evidence.
   - §0.4: failed teardown still emits a signed, integrity-passing receipt.
 """
 from __future__ import annotations
@@ -23,15 +26,19 @@ import unittest
 import uuid
 from datetime import datetime, timezone
 
+from conftest import build_receipt_unchecked
 from orchestrator.evidence import (
     ChainVerificationError,
     MissingLinkError,
     Receipt,
+    SemanticContinuityError,
+    VerifiedChain,
     build_index,
     build_receipt,
     evaluate_admission,
     receipt_from_dict,
     receipt_to_dict,
+    validate_semantic_continuity,
     verify_integrity,
 )
 from orchestrator.schemas import SchemaViolationError
@@ -88,19 +95,36 @@ class TestEvidenceRoundTrip(unittest.TestCase):
         outcome: str = "pass",
         failure: bool = False,
         signer: EvidenceSigner | None = None,
+        profile: str = "p1",
     ) -> tuple[Receipt, Receipt, Receipt, Receipt]:
         s = signer or self.signer
-        prereg = build_receipt("prereg", self.run_id, _prereg(), s.signing_key)
-        execution = build_receipt("execution", self.run_id, _execution(outcome), s.signing_key)
-        teardown = build_receipt("teardown", self.run_id, _teardown(failure), s.signing_key)
+        prereg = build_receipt("prereg", self.run_id, _prereg(profile), s.signing_key)
+        execution = build_receipt(
+            "execution", self.run_id, _execution(outcome, profile), s.signing_key
+        )
+        teardown = build_receipt(
+            "teardown", self.run_id, _teardown(failure, profile), s.signing_key
+        )
         index = build_index(
             self.run_id, prereg, execution, teardown, s.signing_key, s.verify_key_hex
         )
         return prereg, execution, teardown, index
 
+    def _verify(
+        self,
+        prereg: Receipt | None,
+        execution: Receipt | None,
+        teardown: Receipt | None,
+        index: Receipt | None,
+        signer: EvidenceSigner | None = None,
+    ) -> VerifiedChain:
+        s = signer or self.signer
+        return verify_integrity(prereg, execution, teardown, index, s.verify_key)
+
     def test_complete_chain_verifies(self) -> None:
-        prereg, execution, teardown, index = self._full_chain()
-        verify_integrity(prereg, execution, teardown, index, self.signer.verify_key)
+        chain = self._verify(*self._full_chain())
+        self.assertIsInstance(chain, VerifiedChain)
+        self.assertEqual(chain.verify_key_hex, self.signer.verify_key_hex)
 
     def test_serialise_round_trip(self) -> None:
         prereg, *_ = self._full_chain()
@@ -121,22 +145,22 @@ class TestEvidenceRoundTrip(unittest.TestCase):
     def test_missing_prereg_fails_closed(self) -> None:
         _, execution, teardown, index = self._full_chain()
         with self.assertRaises(MissingLinkError):
-            verify_integrity(None, execution, teardown, index, self.signer.verify_key)
+            self._verify(None, execution, teardown, index)
 
     def test_missing_execution_fails_closed(self) -> None:
         prereg, _, teardown, index = self._full_chain()
         with self.assertRaises(MissingLinkError):
-            verify_integrity(prereg, None, teardown, index, self.signer.verify_key)
+            self._verify(prereg, None, teardown, index)
 
     def test_missing_teardown_fails_closed(self) -> None:
         prereg, execution, _, index = self._full_chain()
         with self.assertRaises(MissingLinkError):
-            verify_integrity(prereg, execution, None, index, self.signer.verify_key)
+            self._verify(prereg, execution, None, index)
 
     def test_missing_index_fails_closed(self) -> None:
         prereg, execution, teardown, _ = self._full_chain()
         with self.assertRaises(MissingLinkError):
-            verify_integrity(prereg, execution, teardown, None, self.signer.verify_key)
+            self._verify(prereg, execution, teardown, None)
 
     # ------------------------------------------------------------------
     # §9.9 — malformed chain fails closed
@@ -146,23 +170,22 @@ class TestEvidenceRoundTrip(unittest.TestCase):
         prereg, execution, teardown, index = self._full_chain()
         tampered_payload = copy.deepcopy(execution.payload)
         tampered_payload["outcome"] = "pass" if execution.payload["outcome"] == "fail" else "fail"
-        # Re-sign on a different gated_commit so both digest + signature are wrong
         tampered_payload["gated_commit"] = "deadbeef"
         tampered = Receipt(
             kind=execution.kind,
             run_id=execution.run_id,
             payload=tampered_payload,
-            digest=execution.digest,        # stale digest
-            signature=execution.signature,  # signature over different content
+            digest=execution.digest,
+            signature=execution.signature,
         )
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(prereg, tampered, teardown, index, self.signer.verify_key)
+            self._verify(prereg, tampered, teardown, index)
 
     def test_wrong_verify_key_fails_closed(self) -> None:
-        prereg, execution, teardown, index = self._full_chain()
+        chain = self._full_chain()
         wrong_signer = generate_signer()
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(prereg, execution, teardown, index, wrong_signer.verify_key)
+            self._verify(*chain, signer=wrong_signer)
 
     def test_digest_forgery_fails_closed(self) -> None:
         prereg, execution, teardown, index = self._full_chain()
@@ -170,11 +193,11 @@ class TestEvidenceRoundTrip(unittest.TestCase):
             kind=execution.kind,
             run_id=execution.run_id,
             payload=execution.payload,
-            digest="a" * 64,           # not the real digest
+            digest="a" * 64,
             signature=execution.signature,
         )
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(prereg, forged, teardown, index, self.signer.verify_key)
+            self._verify(prereg, forged, teardown, index)
 
     def test_index_wrong_reference_fails_closed(self) -> None:
         prereg, execution, teardown, _ = self._full_chain()
@@ -186,7 +209,7 @@ class TestEvidenceRoundTrip(unittest.TestCase):
             self.signer.signing_key, self.signer.verify_key_hex,
         )
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(prereg, execution, teardown, wrong_index, self.signer.verify_key)
+            self._verify(prereg, execution, teardown, wrong_index)
 
     # ------------------------------------------------------------------
     # P0-1 — trust anchor: self-signed chain is rejected
@@ -196,22 +219,20 @@ class TestEvidenceRoundTrip(unittest.TestCase):
         """Attacker generates own keypair and self-signs — rejected by trusted anchor check."""
         attacker = generate_signer()
         chain = self._full_chain(signer=attacker)
-        # Verify with the TRUSTED signer's key, not the attacker's key.
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(*chain, self.signer.verify_key)
+            self._verify(*chain)
 
     def test_index_embedded_key_mismatch_fails(self) -> None:
         """Index verify_key_hex was built with a different key than the trusted verifier."""
         attacker = generate_signer()
         prereg, execution, teardown, _ = self._full_chain()
-        # Build index using the attacker's key hex but sign with our signer.
         bad_index = build_index(
             self.run_id, prereg, execution, teardown,
             self.signer.signing_key,
-            attacker.verify_key_hex,  # wrong embedded key
+            attacker.verify_key_hex,
         )
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(prereg, execution, teardown, bad_index, self.signer.verify_key)
+            self._verify(prereg, execution, teardown, bad_index)
 
     # ------------------------------------------------------------------
     # P0-3 — chain topology validation
@@ -220,34 +241,36 @@ class TestEvidenceRoundTrip(unittest.TestCase):
     def test_kind_in_wrong_position_fails(self) -> None:
         """Passing an execution receipt where prereg is expected fails."""
         prereg, execution, teardown, index = self._full_chain()
-        # Pass execution in the prereg slot.
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(execution, prereg, teardown, index, self.signer.verify_key)
+            self._verify(execution, prereg, teardown, index)
 
     def test_cross_run_mixing_fails(self) -> None:
         """Receipts from different runs cannot be mixed into a valid chain."""
         run2 = str(uuid.uuid4())
         prereg2 = build_receipt("prereg", run2, _prereg(), self.signer.signing_key)
         _, execution, teardown, index = self._full_chain()
-        # prereg is from run2; all others are from self.run_id.
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(prereg2, execution, teardown, index, self.signer.verify_key)
+            self._verify(prereg2, execution, teardown, index)
 
     def test_index_run_id_mismatch_fails(self) -> None:
         """Index built for a different run_id than the receipts is rejected."""
         prereg, execution, teardown, _ = self._full_chain()
         other_run_id = str(uuid.uuid4())
-        other_prereg = build_receipt("prereg", other_run_id, _prereg(), self.signer.signing_key)
-        other_exec = build_receipt("execution", other_run_id, _execution(), self.signer.signing_key)
-        other_td = build_receipt("teardown", other_run_id, _teardown(), self.signer.signing_key)
-        # Build a valid index for other_run_id.
+        other_prereg = build_receipt(
+            "prereg", other_run_id, _prereg(), self.signer.signing_key
+        )
+        other_exec = build_receipt(
+            "execution", other_run_id, _execution(), self.signer.signing_key
+        )
+        other_td = build_receipt(
+            "teardown", other_run_id, _teardown(), self.signer.signing_key
+        )
         other_index = build_index(
             other_run_id, other_prereg, other_exec, other_td,
             self.signer.signing_key, self.signer.verify_key_hex,
         )
-        # Present our receipts with other_run_id's index.
         with self.assertRaises(ChainVerificationError):
-            verify_integrity(prereg, execution, teardown, other_index, self.signer.verify_key)
+            self._verify(prereg, execution, teardown, other_index)
 
     # ------------------------------------------------------------------
     # P0-2 — schema completeness
@@ -255,7 +278,7 @@ class TestEvidenceRoundTrip(unittest.TestCase):
 
     def test_missing_schema_field_rejected_at_build(self) -> None:
         """build_receipt rejects payloads missing required fields."""
-        bad_payload = {"config": "p0-test"}  # no schema_version, profile, etc.
+        bad_payload = {"config": "p0-test"}
         with self.assertRaises(SchemaViolationError):
             build_receipt("prereg", self.run_id, bad_payload, self.signer.signing_key)
 
@@ -272,67 +295,116 @@ class TestEvidenceRoundTrip(unittest.TestCase):
             build_receipt("teardown", self.run_id, payload, self.signer.signing_key)
 
     def test_schema_violation_at_verify_is_independent_of_signature(self) -> None:
-        """A receipt with a valid signature over a schema-invalid payload fails verify_integrity.
+        """Schema validation at verify time fires independently of signature verification.
 
-        This tests that schema validation at verify time is an independent gate
-        from signature validation.
+        build_receipt_unchecked produces a Receipt with a valid digest and valid
+        signature over a schema-invalid payload, bypassing build_receipt()'s
+        schema gate. verify_integrity() then rejects it at schema validation —
+        not at digest or signature check — proving the two gates are independent.
         """
-        # Build a valid receipt, then directly construct a Receipt with corrupted payload
-        # that has a valid signature over a DIFFERENT (valid) payload.
-        valid_receipt = build_receipt("prereg", self.run_id, _prereg(), self.signer.signing_key)
-        # Corrupt the stored payload without re-signing (bypasses build_receipt schema check).
-        bad_payload = {"config": "no-schema"}  # schema-invalid
-        invalid_receipt = Receipt(
-            kind=valid_receipt.kind,
-            run_id=valid_receipt.run_id,
-            payload=bad_payload,
-            digest=valid_receipt.digest,
-            signature=valid_receipt.signature,
+        bad_payload: dict = {"not_a_valid_field": "garbage"}  # type: ignore[type-arg]
+        invalid_prereg = build_receipt_unchecked(
+            "prereg", self.run_id, bad_payload, self.signer.signing_key
         )
-        # Digest will mismatch (payload changed), so this fails at digest check.
-        # This also proves schema and digest checks are both enforced.
-        with self.assertRaises(ChainVerificationError):
-            prereg_ok = build_receipt("prereg", self.run_id, _prereg(), self.signer.signing_key)
-            execution = build_receipt(
-                "execution", self.run_id, _execution(), self.signer.signing_key
-            )
-            teardown = build_receipt(
-                "teardown", self.run_id, _teardown(), self.signer.signing_key
-            )
-            index = build_index(
-                self.run_id, prereg_ok, execution, teardown,
-                self.signer.signing_key, self.signer.verify_key_hex,
-            )
-            # Swap valid prereg for the invalid one.
-            verify_integrity(invalid_receipt, execution, teardown, index, self.signer.verify_key)
+        # Build remaining valid receipts using the same run_id.
+        _, execution, teardown, _ = self._full_chain()
+        # Index references invalid_prereg by its (valid) digest.
+        bad_index = build_index(
+            self.run_id, invalid_prereg, execution, teardown,
+            self.signer.signing_key, self.signer.verify_key_hex,
+        )
+        # Digest and signature over the bad payload ARE valid; schema rejects.
+        with self.assertRaises(ChainVerificationError) as cm:
+            self._verify(invalid_prereg, execution, teardown, bad_index)
+        self.assertIn("schema violation", str(cm.exception).lower())
 
     # ------------------------------------------------------------------
-    # P1-2 — admission vs integrity
+    # P1-2 — semantic continuity
+    # ------------------------------------------------------------------
+
+    def test_profile_mismatch_raises_semantic_continuity_error(self) -> None:
+        """Different profiles across prereg/execution/teardown fail the chain."""
+        prereg = build_receipt("prereg", self.run_id, _prereg("p1"), self.signer.signing_key)
+        execution = build_receipt(
+            "execution", self.run_id, _execution("pass", "p2"), self.signer.signing_key
+        )
+        teardown = build_receipt(
+            "teardown", self.run_id, _teardown(profile="p1"), self.signer.signing_key
+        )
+        index = build_index(
+            self.run_id, prereg, execution, teardown,
+            self.signer.signing_key, self.signer.verify_key_hex,
+        )
+        with self.assertRaises(SemanticContinuityError):
+            self._verify(prereg, execution, teardown, index)
+
+    def test_gated_commit_mismatch_raises_semantic_continuity_error(self) -> None:
+        """Execution gated_commit != prereg gated_commit fails the chain."""
+        exec_payload = _execution()
+        exec_payload["gated_commit"] = "deadbeef"
+        prereg = build_receipt("prereg", self.run_id, _prereg(), self.signer.signing_key)
+        execution = build_receipt(
+            "execution", self.run_id, exec_payload, self.signer.signing_key
+        )
+        teardown = build_receipt(
+            "teardown", self.run_id, _teardown(), self.signer.signing_key
+        )
+        index = build_index(
+            self.run_id, prereg, execution, teardown,
+            self.signer.signing_key, self.signer.verify_key_hex,
+        )
+        with self.assertRaises(SemanticContinuityError):
+            self._verify(prereg, execution, teardown, index)
+
+    def test_validate_semantic_continuity_testable_in_isolation(self) -> None:
+        """validate_semantic_continuity can be targeted by tests independently."""
+        prereg = build_receipt("prereg", self.run_id, _prereg("p1"), self.signer.signing_key)
+        execution = build_receipt(
+            "execution", self.run_id, _execution("pass", "p1"), self.signer.signing_key
+        )
+        td_p2 = build_receipt(
+            "teardown", self.run_id, _teardown(profile="p2"), self.signer.signing_key
+        )
+        with self.assertRaises(SemanticContinuityError):
+            validate_semantic_continuity(prereg, execution, td_p2)
+
+    def test_consistent_profile_and_commit_passes(self) -> None:
+        """Identical profiles and matching commits verify cleanly."""
+        chain = self._verify(*self._full_chain())
+        self.assertIsInstance(chain, VerifiedChain)
+
+    # ------------------------------------------------------------------
+    # P1-4 — admission vs integrity, VerifiedChain gate
     # ------------------------------------------------------------------
 
     def test_teardown_failure_verifies_but_not_admitted(self) -> None:
-        """§0.4: failed teardown is signed evidence of what happened; not a successful run."""
+        """§0.4: failed teardown is signed evidence of what happened; not admissible."""
         prereg, execution, teardown, index = self._full_chain(failure=True)
-        # Integrity must pass.
-        verify_integrity(prereg, execution, teardown, index, self.signer.verify_key)
-        # Admission must fail.
-        self.assertFalse(evaluate_admission(prereg, execution, teardown))
+        chain = self._verify(prereg, execution, teardown, index)
+        self.assertIsInstance(chain, VerifiedChain)
+        self.assertFalse(evaluate_admission(chain))
+        self.assertFalse(chain.is_admitted)
         self.assertTrue(teardown.payload["failure"])
 
     def test_error_outcome_verifies_but_not_admitted(self) -> None:
-        """Infrastructure error (outcome='error') is signed but not a UAT verdict."""
+        """Infrastructure error (outcome='error') is signed but not admissible evidence."""
         prereg, execution, teardown, index = self._full_chain(outcome="error")
-        verify_integrity(prereg, execution, teardown, index, self.signer.verify_key)
-        self.assertFalse(evaluate_admission(prereg, execution, teardown))
+        chain = self._verify(prereg, execution, teardown, index)
+        self.assertFalse(evaluate_admission(chain))
+        self.assertFalse(chain.is_admitted)
 
     def test_clean_pass_is_admitted(self) -> None:
-        prereg, execution, teardown, _ = self._full_chain(outcome="pass")
-        self.assertTrue(evaluate_admission(prereg, execution, teardown))
+        prereg, execution, teardown, index = self._full_chain(outcome="pass")
+        chain = self._verify(prereg, execution, teardown, index)
+        self.assertTrue(evaluate_admission(chain))
+        self.assertTrue(chain.is_admitted)
 
     def test_clean_fail_is_admitted(self) -> None:
-        """A UAT verdict of 'fail' is still admissible evidence."""
-        prereg, execution, teardown, _ = self._full_chain(outcome="fail")
-        self.assertTrue(evaluate_admission(prereg, execution, teardown))
+        """A gated 'fail' verdict IS admissible evidence."""
+        prereg, execution, teardown, index = self._full_chain(outcome="fail")
+        chain = self._verify(prereg, execution, teardown, index)
+        self.assertTrue(evaluate_admission(chain))
+        self.assertTrue(chain.is_admitted)
 
 
 if __name__ == "__main__":

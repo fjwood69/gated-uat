@@ -118,8 +118,8 @@ def validate_execution_payload(payload: dict[str, Any]) -> None:
         raise SchemaViolationError(f"canonical_digest_alg: expected 'sha256', got {alg!r}")
 
     cdv = _require(payload, "canonical_digest_version", types=(int,))
-    if cdv < 1:
-        raise SchemaViolationError(f"canonical_digest_version: must be >= 1, got {cdv}")
+    if cdv != 1:
+        raise SchemaViolationError(f"canonical_digest_version: must be exactly 1, got {cdv}")
 
 
 def validate_teardown_payload(payload: dict[str, Any]) -> None:

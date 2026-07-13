@@ -6,17 +6,18 @@ Board-ratified chain: four independently-signed receipts + a final index.
 
 INTEGRITY vs ADMISSION are separate concerns:
 
-  verify_integrity(chain, verify_key)
+  verify_integrity(chain, verify_key) -> VerifiedChain
       Cryptographic + structural validity: signatures, digest matches, kind
-      positions, run_id consistency, trust-anchor check, schema completeness.
-      A chain with teardown.failure=True still passes integrity; it is a
+      positions, run_id consistency, trust-anchor check, schema completeness,
+      semantic continuity (§P1-2). Returns a VerifiedChain on success.
+      A chain with teardown.failure=True still passes integrity — it is a
       valid signed record of what happened.
 
-  evaluate_admission(chain) -> bool
-      Evidence admissibility: was the run complete and clean? Rejects chains
-      where execution errored (infrastructure failure) or teardown failed.
-      Separate from integrity — a failed-teardown chain may be cryptographically
-      valid but must not be counted as a successful UAT run.
+  evaluate_admission(chain: VerifiedChain) -> bool
+      Evidence admissibility: was the run clean enough to be counted?
+      Accepts only a VerifiedChain to ensure integrity was verified first.
+      A gated "fail" verdict IS admissible evidence. An "error" outcome or
+      a failed teardown is NOT — those are infrastructure failures.
 
 Trust anchor:
   verify_key (the externally-pinned VerifyKey) IS the trust root. After
@@ -25,10 +26,11 @@ Trust anchor:
   with a different key fails the signature check; even if signatures matched,
   their embedded key would not equal the pinned trusted anchor.
 
-Canonicalizer coupling (§P1):
-  All digest calls use canonical_digest(version=1) explicitly. The alg and
-  version are recorded in execution receipts. A gated-internal version change
-  must bump EVIDENCE_CHAIN_VERSION here and is visible in all signed evidence.
+Canonicalizer version (§P1-1):
+  CANONICAL_DIGEST_VERSION is pinned locally as the literal 1. It is NOT
+  imported from core.chain — if gated bumps its constant, evidence-chain v1
+  is unaffected. The version is recorded in execution receipts; a future
+  evidence-chain version must define a new local literal.
 """
 from __future__ import annotations
 
@@ -36,16 +38,21 @@ import copy
 from dataclasses import dataclass
 from typing import Any
 
-from core.chain import CANONICAL_DIGEST_VERSION, canonical_digest
+from core.chain import canonical_digest
 from nacl.encoding import HexEncoder
 from nacl.signing import SigningKey, VerifyKey
 
-from .schemas import SchemaViolationError, validate_payload
+from .schemas import SIGNER_ROLE, SchemaViolationError, validate_payload
 from .trust import BadSignatureError, sign_receipt, verify_receipt_sig
 
 EVIDENCE_CHAIN_VERSION = 1
-_DOMAIN_PREFIX = "gated-uat-evidence"
-_CANONICAL_ALG = "sha256"
+
+# Canonicalization protocol constants — public because they are the wire-format
+# contract. Third-party verifiers and tests need the exact domain/envelope
+# structure to reproduce digests. CANONICAL_DIGEST_VERSION is pinned locally
+# (do NOT import from core.chain).
+CANONICAL_DIGEST_VERSION = 1
+DOMAIN_PREFIX = "gated-uat-evidence"
 
 # The expected receipt kinds in chain order (position is validated).
 _CHAIN_ORDER = ("prereg", "execution", "teardown", "index")
@@ -64,6 +71,10 @@ class MissingLinkError(ChainVerificationError):
     """A required receipt is absent from the chain."""
 
 
+class SemanticContinuityError(ChainVerificationError):
+    """Receipt payloads are internally inconsistent across the chain."""
+
+
 # ------------------------------------------------------------------
 # Receipt dataclass
 # ------------------------------------------------------------------
@@ -79,17 +90,58 @@ class Receipt:
 
 
 # ------------------------------------------------------------------
-# Building receipts
+# VerifiedChain — proof that verify_integrity passed (§P1-4)
 # ------------------------------------------------------------------
 
 
-def _envelope(kind: str, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+@dataclass(frozen=True)
+class VerifiedChain:
+    """Proof-of-integrity: verify_integrity() returns this on success.
+
+    evaluate_admission() accepts only this type, ensuring callers cannot
+    skip integrity verification before checking admissibility.
+
+    verify_key_hex stores the trusted verifying key as a stable, hashable,
+    serialisable hex string rather than a nacl VerifyKey object (which is
+    not guaranteed hashable, breaking frozen-dataclass __hash__).
+    """
+
+    prereg: Receipt
+    execution: Receipt
+    teardown: Receipt
+    index: Receipt
+    verify_key_hex: str  # hex Ed25519 key that verified this chain
+
+    @property
+    def is_admitted(self) -> bool:
+        """Convenience delegation to evaluate_admission(self)."""
+        return evaluate_admission(self)
+
+
+# ------------------------------------------------------------------
+# Canonicalisation helpers (public protocol surface)
+# ------------------------------------------------------------------
+
+
+def canonical_envelope(
+    kind: str, run_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Build the canonical envelope for digest/signature computation.
+
+    This is the wire-format contract — public so third-party verifiers and
+    tests can reproduce digests without depending on private internals.
+    """
     return {
         "kind": kind,
         "run_id": run_id,
         "payload": payload,
         "chain_version": EVIDENCE_CHAIN_VERSION,
     }
+
+
+# ------------------------------------------------------------------
+# Building receipts
+# ------------------------------------------------------------------
 
 
 def build_receipt(
@@ -106,9 +158,11 @@ def build_receipt(
     """
     validate_payload(kind, payload)
     safe_payload: dict[str, Any] = copy.deepcopy(payload)
-    domain = f"{_DOMAIN_PREFIX}-{kind}"
+    domain = f"{DOMAIN_PREFIX}-{kind}"
     digest = canonical_digest(
-        domain, _envelope(kind, run_id, safe_payload), version=CANONICAL_DIGEST_VERSION
+        domain,
+        canonical_envelope(kind, run_id, safe_payload),
+        version=CANONICAL_DIGEST_VERSION,
     )
     sig = sign_receipt(kind, digest, signing_key)
     return Receipt(kind=kind, run_id=run_id, payload=safe_payload, digest=digest, signature=sig)
@@ -123,7 +177,6 @@ def build_index(
     verify_key_hex: str,
 ) -> Receipt:
     """Build and sign the index receipt, referencing the three prior receipts by digest."""
-    from .schemas import SIGNER_ROLE
     payload: dict[str, Any] = {
         "schema_version": 1,
         "prereg": prereg.digest,
@@ -133,6 +186,41 @@ def build_index(
         "signer_role": SIGNER_ROLE,
     }
     return build_receipt("index", run_id, payload, signing_key)
+
+
+# ------------------------------------------------------------------
+# Semantic continuity — §P1-2
+# ------------------------------------------------------------------
+
+
+def validate_semantic_continuity(
+    prereg: Receipt,
+    execution: Receipt,
+    teardown: Receipt,
+) -> None:
+    """Verify semantic consistency across the three evidence receipts.
+
+    Raises SemanticContinuityError if:
+    - profile is not identical across all three receipts
+    - execution.gated_commit != prereg.gated_commit
+
+    Called from verify_integrity() after per-receipt checks complete.
+    Also testable in isolation by passing Receipt objects directly.
+    """
+    prereg_profile = prereg.payload.get("profile")
+    exec_profile = execution.payload.get("profile")
+    td_profile = teardown.payload.get("profile")
+    if prereg_profile != exec_profile or prereg_profile != td_profile:
+        raise SemanticContinuityError(
+            f"Profile mismatch across chain: "
+            f"prereg={prereg_profile!r} execution={exec_profile!r} teardown={td_profile!r}"
+        )
+    prereg_commit = prereg.payload.get("gated_commit")
+    exec_commit = execution.payload.get("gated_commit")
+    if prereg_commit != exec_commit:
+        raise SemanticContinuityError(
+            f"gated_commit mismatch: prereg={prereg_commit!r} execution={exec_commit!r}"
+        )
 
 
 # ------------------------------------------------------------------
@@ -146,21 +234,20 @@ def verify_integrity(
     teardown: Receipt | None,
     index: Receipt | None,
     verify_key: VerifyKey,
-) -> None:
+) -> VerifiedChain:
     """Verify the complete four-link evidence chain — INTEGRITY only.
 
     Checks (all independently, all required):
     1. No link is missing (MissingLinkError).
     2. Each receipt is in the expected position (kind matches position).
     3. All receipts share the same run_id.
-    4. Each receipt's stored digest matches the recomputed digest.
-    5. Each receipt's signature is valid under *verify_key*.
-    6. Schema completeness: each payload passes its kind-specific validator.
+    4–6. Per-receipt: digest recompute, signature, schema.
     7. Index cross-references match the actual prior receipt digests.
     8. Trust anchor: index.verify_key_hex encodes the same key as *verify_key*.
+    9. Semantic continuity: identical profile, consistent gated_commit.
 
-    Malformed hex inputs are wrapped in ChainVerificationError.
-    Does NOT assess admission (outcome, teardown success) — see evaluate_admission.
+    Returns a VerifiedChain on success. Raises on any failure (fail-closed).
+    Does NOT assess admission — see evaluate_admission(VerifiedChain).
     """
     # 1. Missing links.
     for name, receipt in zip(_CHAIN_ORDER, (prereg, execution, teardown, index)):
@@ -185,14 +272,17 @@ def verify_integrity(
         raise ChainVerificationError(
             f"Receipts have inconsistent run_ids: {run_ids!r}"
         )
-    canonical_run_id = prereg.run_id
 
-    # 4 + 5 + 6. Per-receipt: digest recompute, signature, schema.
+    # 4–6. Per-receipt: digest recompute, signature, schema.
     for receipt in (prereg, execution, teardown, index):
         _verify_one(receipt, verify_key)
 
     # 7. Index cross-references.
-    for name, receipt in (("prereg", prereg), ("execution", execution), ("teardown", teardown)):
+    for name, receipt in (
+        ("prereg", prereg),
+        ("execution", execution),
+        ("teardown", teardown),
+    ):
         expected = receipt.digest
         got = index.payload.get(name)
         if got != expected:
@@ -209,16 +299,25 @@ def verify_integrity(
             "the chain was not signed by the trusted EvidenceSigner"
         )
 
-    _ = canonical_run_id  # used implicitly via run_ids check above
+    # 9. Semantic continuity.
+    validate_semantic_continuity(prereg, execution, teardown)
+
+    return VerifiedChain(
+        prereg=prereg,
+        execution=execution,
+        teardown=teardown,
+        index=index,
+        verify_key_hex=trusted_hex,
+    )
 
 
 def _verify_one(receipt: Receipt, verify_key: VerifyKey) -> None:
     """Verify a single receipt: digest recompute + signature + schema."""
-    domain = f"{_DOMAIN_PREFIX}-{receipt.kind}"
+    domain = f"{DOMAIN_PREFIX}-{receipt.kind}"
     try:
         expected = canonical_digest(
             domain,
-            _envelope(receipt.kind, receipt.run_id, receipt.payload),
+            canonical_envelope(receipt.kind, receipt.run_id, receipt.payload),
             version=CANONICAL_DIGEST_VERSION,
         )
     except Exception as exc:
@@ -252,27 +351,29 @@ def _verify_one(receipt: Receipt, verify_key: VerifyKey) -> None:
 
 
 # ------------------------------------------------------------------
-# Admission — separate from integrity
+# Admission — separate from integrity, requires VerifiedChain (§P1-4)
 # ------------------------------------------------------------------
 
 
-def evaluate_admission(
-    prereg: Receipt,
-    execution: Receipt,
-    teardown: Receipt,
-) -> bool:
-    """Assess whether a chain is admissible as successful UAT evidence.
+def evaluate_admission(chain: VerifiedChain) -> bool:
+    """Assess whether a VerifiedChain constitutes admissible UAT evidence.
 
-    Returns True only when:
+    Accepts only a VerifiedChain — integrity must be verified before
+    admission is checked. Callers cannot bypass verify_integrity().
+
+    Returns True when:
     - execution.outcome is "pass" or "fail" (a UAT verdict, not infra error)
     - teardown.failure is False (the run was cleanly torn down)
 
-    A chain that fails admission may still be valid evidence of what happened
-    (verify_integrity passes); it is not counted as a successful UAT run.
-    Callers should log non-admissible chains rather than discarding them.
+    A gated "fail" verdict IS admissible — it is evidence that the gate
+    correctly blocked a non-compliant promotion. An "error" outcome or a
+    failed teardown is NOT admissible (infrastructure failure, not a verdict).
+
+    Non-admissible chains should be logged rather than discarded; they are
+    still cryptographically valid records of what happened.
     """
-    teardown_clean = not bool(teardown.payload.get("failure", True))
-    execution_outcome = execution.payload.get("outcome", "error")
+    teardown_clean = not bool(chain.teardown.payload.get("failure", True))
+    execution_outcome = chain.execution.payload.get("outcome", "error")
     return teardown_clean and execution_outcome in ("pass", "fail")
 
 
@@ -287,9 +388,9 @@ def verify_chain(
     teardown: Receipt | None,
     index: Receipt | None,
     verify_key: VerifyKey,
-) -> None:
+) -> VerifiedChain:
     """Alias for verify_integrity. Prefer verify_integrity in new code."""
-    verify_integrity(prereg, execution, teardown, index, verify_key)
+    return verify_integrity(prereg, execution, teardown, index, verify_key)
 
 
 # ------------------------------------------------------------------
