@@ -45,6 +45,12 @@ class EnforcementSeedError(RuntimeError):
     the policy is not ENABLED after ratify). Fail-closed — never seed from a non-passing run."""
 
 
+class EnforcementEvidenceError(RuntimeError):
+    """The signed enforcement chain could not be minted coherently (e.g. the dispatched plan's
+    policy does not match the enforced one). Fail-closed — never sign incoherent enforcement
+    evidence."""
+
+
 @dataclass(frozen=True)
 class SeedProvenance:
     """How the seeded policy reached ENABLED — signed into the receipt so the evidence attests
@@ -395,11 +401,27 @@ class GatedEnforcementAdapter:
                 "installation_id": event.installation_id,
                 "head_repo_full_name": event.head_repo_full_name}, version=1)
 
+            # LOAD-BEARING capture: bind plan_policy_id to the ACTUAL DISPATCHED decision the runner
+            # acted on (the GateDecision the replica closure captured), not a re-derived value. When
+            # a plan was minted (RUN_ENFORCING → admitted / refused) the receipt records THAT plan's
+            # policy; a non-run dispatched no plan, so the enforced policy is the configured target.
+            # Either way the dispatched policy MUST equal the configured one (the job runner's
+            # dispatch recheck guarantees it for a run that produced a JobResult); assert it so a
+            # mis-dispatch can never mint incoherent evidence.
+            decision = captured.get("decision")
+            dispatched_plan = getattr(decision, "plan", None) if decision is not None else None
+            plan_policy_id = (
+                dispatched_plan.policy_id if dispatched_plan is not None else seed.policy_id)
+            if plan_policy_id != seed.policy_id:
+                raise EnforcementEvidenceError(
+                    f"dispatched plan policy {plan_policy_id!r} != the enforced policy "
+                    f"{seed.policy_id!r} — refusing enforcement evidence for a mis-dispatch")
+
             exec_payload: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION_ENFORCEMENT, "profile": config.profile,
                 "gated_commit": config.gated_commit, "outcome": outcome.outcome,
                 "executed_at": _now_iso(), "canonical_digest_alg": "sha256",
-                "canonical_digest_version": 1, "plan_policy_id": seed.policy_id,
+                "canonical_digest_version": 1, "plan_policy_id": plan_policy_id,
                 "result_kind": outcome.result_kind, "result_reason": outcome.reason,
                 "result_sub_reason": outcome.sub_reason, "event_digest": event_digest}
             if outcome.gate_outcome is not None:
