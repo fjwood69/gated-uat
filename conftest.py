@@ -5,7 +5,8 @@ the sibling checkout at ../gated. The pinned commit and clean-tree invariant are
 enforced by orchestrator.gated_pin.verify_gated_dependency() — the same function
 the CLI calls — so pytest and the installed CLI share exactly one enforcement path.
 
-Pinned: 628e5a3 (gated 3.5 S3 ckpt3: trust + guard policy provenance through CalibrationResult)
+Pinned: 1d75d54 (gated 3.5 S3-completion: cross-store ABA closure + torn-read atomicity).
+The authoritative pin lives in orchestrator.gated_pin._PINNED_COMMIT — this line is prose.
 canonical_digest API contract: core.chain.canonical_digest(domain, payload, *, version=int) -> str
 """
 
@@ -21,7 +22,7 @@ from nacl.signing import SigningKey
 # Dedicated pin worktree — never reuse /home/nucadmin/gated (the live step-3.5-jobs
 # checkout).  One-time setup: run
 #   git -C /home/nucadmin/gated worktree add --detach /home/nucadmin/gated-uat-pin \
-#       628e5a3d8274a74bb74cecaf7667fdf989398ebd
+#       1d75d54a97986e18fae499c370f8615e6cf89e15
 # then leave it in place.
 _GATED_DEV = Path(__file__).parent.parent / "gated-uat-pin"
 
