@@ -11,9 +11,9 @@ import subprocess
 from pathlib import Path
 
 # Full 40-char SHA — 7-char prefixes are 28 bits and not authoritative.
-_PINNED_COMMIT = "628e5a3d8274a74bb74cecaf7667fdf989398ebd"
+_PINNED_COMMIT = "1d75d54a97986e18fae499c370f8615e6cf89e15"
 # Short form used in display-only contexts (error messages, receipts).
-_PINNED_COMMIT_SHORT = "628e5a3"
+_PINNED_COMMIT_SHORT = "1d75d54"
 
 
 def verify_gated_dependency(gated_dir: Path) -> str:
