@@ -11,7 +11,7 @@ dependencies = [
 ]
 # gated is a required dependency but is not yet published to PyPI.
 # Development layout: sibling checkout at ../gated added to PYTHONPATH via conftest.py.
-# Pinned commit: 628e5a3 (3.5 S3 ckpt3: trust + guard policy provenance)
+# Pinned commit: 1d75d54 (3.5 S3-completion: cross-store ABA closure + torn-read atomicity, SEALED)
 # Production deploy-tier: install gated from the pinned artifact hash (§11, not built here).
 
 [project.scripts]
@@ -27,6 +27,9 @@ dev = [
 [tool.mypy]
 strict = true
 ignore_missing_imports = true
+# corpora/fixtures/*/main.py are executable test artifacts (all named main.py -> module-name
+# collision); they are not package code. Excluded to match [tool.ruff], so `mypy --strict .` is clean.
+exclude = ["corpora/"]
 
 # gated's modules are an external pinned dependency — suppress unused-ignore warnings
 # that arise because nacl stubs are installed on this system but gated's code predates
