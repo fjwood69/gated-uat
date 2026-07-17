@@ -281,6 +281,9 @@ def validate_semantic_continuity(
     Raises SemanticContinuityError if:
     - profile is not identical across all three receipts
     - execution.gated_commit != prereg.gated_commit
+    - (v3 enforcement) execution.plan_policy_id != prereg.policy_id — the enforced policy
+      must be the PREREGISTERED one; a run cannot post-hoc choose which policy its signed
+      evidence attests to.
 
     Called from verify_integrity() after per-receipt checks complete.
     Also testable in isolation by passing Receipt objects directly.
@@ -299,6 +302,16 @@ def validate_semantic_continuity(
         raise SemanticContinuityError(
             f"gated_commit mismatch: prereg={prereg_commit!r} execution={exec_commit!r}"
         )
+    # v3 enforcement continuity: the enforced policy is bound to the preregistration.
+    if execution.payload.get("schema_version") == 3:
+        prereg_policy = prereg.payload.get("policy_id")
+        exec_policy = execution.payload.get("plan_policy_id")
+        if prereg_policy != exec_policy:
+            raise SemanticContinuityError(
+                f"enforced policy mismatch: prereg.policy_id={prereg_policy!r} != "
+                f"execution.plan_policy_id={exec_policy!r} — the run enforced a policy that was "
+                "not preregistered"
+            )
 
 
 # ------------------------------------------------------------------
