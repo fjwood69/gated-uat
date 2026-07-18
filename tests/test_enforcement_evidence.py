@@ -26,6 +26,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from core import ResourceBudget
 from core.calibration import Fixture, FixtureLabel
@@ -40,10 +41,16 @@ from orchestrator.enforcement_driver import (
 )
 from orchestrator.expectations import ScenarioId, expected_for
 from orchestrator.isolation import Registry
+from orchestrator.schemas import (
+    enforcement_expected_triple,
+    enforcement_observed_triple,
+)
 
 from ._aba_scheduler import AbaInjectionScheduler
+from ._tamper_scheduler import TamperInjectionScheduler
 
 _IMAGE_REF = "localhost/mori:local"
+_IMAGE_REF_2 = "localhost/mori-uat:local"  # a DISTINCT image → a distinct execution identity
 _CORPUS = Path(__file__).resolve().parent.parent / "corpora" / "fixtures"
 
 
@@ -66,6 +73,25 @@ def _resolve_image_digest(image_ref: str) -> str | None:
         return None
     image_id = r.stdout.strip()
     return image_id if image_id.startswith("sha256:") else "sha256:" + image_id
+
+
+def _seed(tmp: Path, image_ref: str = _IMAGE_REF) -> tuple[PolicyStore, CalibrationStore, Any]:
+    """Bring ``uat-enforce`` to a REAL ENABLED policy on ``image_ref`` via gated's lifecycle — the
+    shared preamble for every through-``enforce`` scenario below."""
+    ps = PolicyStore(tmp / "p.db")
+    cs = CalibrationStore(tmp / "c.db")
+    good = (Fixture(
+        fixture_id="good", label=FixtureLabel.KNOWN_GOOD,
+        payload=(_CORPUS / "retry-good-v1" / "main.py").read_bytes(), evasion_class=None),)
+    bad = (Fixture(
+        fixture_id="bad", label=FixtureLabel.KNOWN_BAD,
+        payload=(_CORPUS / "retry-swallow-v1" / "main.py").read_bytes(),
+        evasion_class="exception-swallowing"),)
+    prov = seed_enabled_policy(
+        policy_store=ps, calibration_store=cs, policy_id="uat-enforce", detector_id="RetryCheck",
+        image_ref=image_ref, known_good=good, known_bad=bad,
+        budget=ResourceBudget(wall_clock_seconds=120.0), trials=1)
+    return ps, cs, prov
 
 
 @unittest.skipUnless(
@@ -224,6 +250,139 @@ class AbaScenarioEvidenceTests(unittest.TestCase):
         # free config literal): what the harness actually did, gated on the injection completing.
         self.assertEqual(ep["fault_injection"], disc)
         # the prereg was PERSISTED at mint (orphan-prereg audit survives even a refused run).
+        self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class DegradedScenarioEvidenceTests(unittest.TestCase):
+    """NON_ENABLED_DEGRADED end-to-end: a formerly-ENABLED policy transitioned to DEGRADED (a REAL
+    revocation) must BLOCK — a non-run with block_action_required, never a silent neutral. The
+    signed chain is ADMISSIBLE because the observed block CONFIRMS the prediction (the invariant "a
+    revoked control keeps controlling": expecting BLOCK is what makes an observed SKIP_NEUTRAL a
+    fail). The engine is never reached (the disposition refuses before the sandbox)."""
+
+    def test_degraded_policy_yields_signed_admissible_nonrun_block(self) -> None:
+        from gate.authority import GovernanceApproval
+        from gate.policy_state import PolicyState
+
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-degraded-"))
+        ps, cs, prov = _seed(tmp)
+        # revoke: ENABLED -> DEGRADED via gated's REAL transition (dual-principal approval).
+        ps.transition(
+            "uat-enforce", PolicyState.DEGRADED,
+            approval=GovernanceApproval(
+                principals=("uat-op-1", "uat-op-2"), purpose="uat-degrade",
+                rationale="revoke a live control to prove it keeps blocking",
+                operation_id="uat-degrade"))
+        signing_key = SigningKey.generate()
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.NON_ENABLED_DEGRADED, policy_store=ps, calibration_store=cs,
+            seed=prov, image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1",
+            runs_dir=tmp / "runs", signing_key=signing_key, verify_key=signing_key.verify_key,
+            registry=Registry(tmp / "registry.db"), head_sha="a" * 40, trials=1,
+            budget=ResourceBudget(wall_clock_seconds=120.0))
+
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        # a DEGRADED policy BLOCKS (fail-closed) as a non-run — never falls silent to neutral.
+        self.assertEqual(outcome.result_kind, "non_run")
+        self.assertEqual(outcome.reason, "block_action_required")
+        # predicted-and-observed block → admissible evidence.
+        self.assertTrue(chain.is_admitted)
+        pp, ep = chain.prereg.payload, chain.execution.payload
+        self.assertEqual(pp["expected_kind"], "non_run")
+        self.assertEqual(pp["expected_reason"], "block_action_required")
+        self.assertEqual(ep["result_kind"], "non_run")
+        # coherence law: a non_run carrying BLOCK_ACTION_REQUIRED is a block_gate, not neutral_gate.
+        self.assertEqual(ep["gate_outcome"], "block_gate")
+        # a non_run dispatched no plan → an EXPLICIT null plan policy (present-and-null, not gone).
+        self.assertIsNone(ep["plan_policy_id"])
+        self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF) and _podman_image_available(_IMAGE_REF_2),
+    f"{_IMAGE_REF} + {_IMAGE_REF_2} both required in the Podman image store",
+)
+class SubjectDriftScenarioEvidenceTests(unittest.TestCase):
+    """SUBJECT_DRIFT_SECOND_IMAGE end-to-end: the artifact tree is SHA-bind-protected, so drift is
+    induced via the IMAGE coordinate. Calibrate on ``_IMAGE_REF``, enforce on a DISTINCT image
+    (``_IMAGE_REF_2``): the measured execution identity differs from the calibrated subject → the
+    measured composite != the dispatched target → admit refuses (SUBJECT_DRIFT). The signed chain is
+    ADMISSIBLE (the drift was predicted) and continuity binds the seed image ≠ the run image."""
+
+    def test_second_image_yields_signed_admissible_subject_drift(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-drift-"))
+        ps, cs, prov = _seed(tmp, image_ref=_IMAGE_REF)  # calibrated on image 1
+        signing_key = SigningKey.generate()
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE, policy_store=ps, calibration_store=cs,
+            seed=prov, image_ref=_IMAGE_REF_2,  # ENFORCE on image 2 — a distinct execution identity
+            artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs", signing_key=signing_key,
+            verify_key=signing_key.verify_key, registry=Registry(tmp / "registry.db"),
+            head_sha="a" * 40, trials=1, budget=ResourceBudget(wall_clock_seconds=120.0))
+
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        # a second-image run measures a drifted subject → a blocking refusal, never a silent pass.
+        self.assertEqual(outcome.result_kind, "blocking_refusal")
+        self.assertEqual(outcome.reason, "subject_drift")
+        self.assertTrue(chain.is_admitted)
+        pp, ep = chain.prereg.payload, chain.execution.payload
+        self.assertEqual(pp["expected_reason"], "subject_drift")
+        self.assertEqual(ep["result_kind"], "blocking_refusal")
+        self.assertEqual(ep["gate_outcome"], "run_verdict")  # a refused completed run
+        # continuity: the configured RUN image == rc_image_digest, and the SEED image differs from
+        # it (the drift endpoints) — the schema's subject_drift continuity binding, proven live.
+        self.assertEqual(ep["drift_image_digest"], pp["rc_image_digest"])
+        self.assertNotEqual(ep["seed_trace"]["seed_image_digest"], pp["rc_image_digest"])
+        self.assertEqual(ep["seed_trace"]["seed_image_digest"], prov.seed_image_digest)
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class ShaTamperScenarioEvidenceTests(unittest.TestCase):
+    """SHA_TAMPER end-to-end: a TOCTOU tamper (mutate the tree AFTER the SHA-bind) is caught by the
+    sandbox re-verify → InfrastructureFailure(ARTIFACT_INTEGRITY_MISMATCH). The signed chain is a
+    valid record whose observed triple CONFIRMS the prediction — yet it is NON-admissible (amendment
+    3: infra proves the plumbing held, not that the gate judged; infra is never enforcement
+    evidence, even when predicted+matched). The tamper is disclosed via the scheduler's COMPLETED
+    record (demanded by ``enforce``)."""
+
+    def test_sha_tamper_yields_signed_nonadmissible_infra_failure(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-tamper-"))
+        ps, cs, prov = _seed(tmp)
+        signing_key = SigningKey.generate()
+        tamper = TamperInjectionScheduler(artifact_dir=_CORPUS / "retry-good-v1")
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.SHA_TAMPER, policy_store=ps, calibration_store=cs, seed=prov,
+            image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs",
+            signing_key=signing_key, verify_key=signing_key.verify_key,
+            registry=Registry(tmp / "registry.db"), head_sha="a" * 40, trials=1,
+            budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=tamper.artifact_source, fault_scheduler=tamper)
+
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        # the SHA-bind caught the post-hash mutation → a blocking infra failure, never a pass.
+        self.assertEqual(outcome.result_kind, "infrastructure_failure")
+        self.assertEqual(outcome.reason, "artifact_integrity_mismatch")
+        pp, ep = chain.prereg.payload, chain.execution.payload
+        # the PREDICTION was correct (observed triple == expected triple) ...
+        self.assertEqual(enforcement_observed_triple(ep), enforcement_expected_triple(pp))
+        # ... yet the chain is NON-admissible: infra is never enforcement evidence (amendment 3).
+        self.assertFalse(chain.is_admitted)
+        # the tamper disclosure IS the scheduler's COMPLETED record — the sealed schema's base
+        # disclosure triple (locus / mechanism / interleaving_point), all non-empty.
+        disc = tamper.require_completed_disclosure()
+        self.assertEqual(ep["fault_injection"], disc)
+        self.assertEqual(set(disc), {"locus", "mechanism", "interleaving_point"})
         self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
 
 

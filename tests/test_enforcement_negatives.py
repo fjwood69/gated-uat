@@ -1,55 +1,42 @@
-"""tests/test_enforcement_negatives.py — Phase 2 slice 2.1c: the live-enforcement REFUSAL matrix.
+"""tests/test_enforcement_negatives.py — the below-seam refusal mechanism (slice 2.1).
 
-Each negative drives gated's REAL ``make_gated_job_runner`` (the same path 2.1b's adapter wires)
-and asserts the fail-closed outcome ``map_job_result`` projects. The refusals are induced by REAL
-state / REAL sequenced writes / a REAL second image — never a fabricated JobResult or a short read:
+Two refusals that produce NO signed evidence chain (so they live here, not in the matrix evidence
+suite) — each drives gated's REAL ``make_gated_job_runner`` directly, BELOW the 2.1b adapter seam:
 
-  (b) a non-ENABLED policy               -> NonRunDecision (engine NEVER runs)
+  (b) a never-ENABLED (PENDING) policy   -> NonRunDecision(SKIP_NEUTRAL) — engine NEVER runs
   (e) a mis-routed WELL-FORMED plan      -> GateDecisionError (dispatch-time policy_id recheck)
-  (c) a below-seam cross-store ABA       -> BlockingRefusal(POLICY_GENERATION_MOVED)
-  (d) enforcement on a SECOND image      -> BlockingRefusal(SUBJECT_DRIFT)
-  (f) a SHA-bind artifact tamper (TOCTOU) -> InfrastructureFailure(ARTIFACT_INTEGRITY_MISMATCH)
 
-(b)+(e) need no engine (the refusal precedes the sandbox); (c)/(d)/(f) are podman-gated and seed a
-real ENABLED policy first. Constructing the runner directly (rather than through the evidence-chain
-adapter) tests gated's enforcement mechanism BELOW the 2.1b seam; the wiring-pin test in
-test_enforcement_evidence keeps that direct wiring aligned with production.
+These are engine-free: the refusal precedes the sandbox, so no podman is needed. (b) is the
+NEUTRAL-tautology CONTRAST to the through-``enforce`` NON_ENABLED_DEGRADED scenario — a
+never-enabled policy legitimately neutrals (it never controlled anything), which is why the DEGRADED
+scenario, not this one, carries the "a revoked control keeps controlling" invariant. (e) produces no
+JobResult at all (the plan is mis-routed before any run), so per the Q3 ruling it is a plain
+``assertRaises`` — never a signed "raise record".
+
+The through-``enforce`` matrix scenarios (COMPLIANT_ADMIT, ABA_GENERATION_MOVED,
+NON_ENABLED_DEGRADED, SUBJECT_DRIFT_SECOND_IMAGE, SHA_TAMPER) — which DO emit signed chains judged
+by admissibility — live in ``test_enforcement_evidence``. The ABA there is a REAL store-layer
+injection (``_aba_scheduler``), superseding this file's former governance-wrapper ABA.
 """
 
 from __future__ import annotations
 
 import shutil
-import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from typing import Any
 
-from core import ResourceBudget
-from core.calibration import Fixture, FixtureLabel
 from gate.calibration_store import CalibrationStore
 from gate.policy_store import PolicyStore
 from gate.queue import GatingEvent
 
-from orchestrator.enforcement_driver import (
-    SeedProvenance,
-    map_job_result,
-    seed_enabled_policy,
-)
+from orchestrator.enforcement_driver import map_job_result
 from orchestrator.gated_pin import ACCEPTED_RETRYCHECK_PROFILE_DIGEST
 
 _IMAGE_REF = "localhost/mori:local"
-_IMAGE_REF_2 = "localhost/mori-uat:local"  # a DISTINCT image → a distinct execution identity
 _CORPUS = Path(__file__).resolve().parent.parent / "corpora" / "fixtures"
-
-
-def _podman_image_available(image_ref: str) -> bool:
-    if not shutil.which("podman"):
-        return False
-    return subprocess.run(
-        ["podman", "image", "exists", image_ref], capture_output=True
-    ).returncode == 0
 
 
 def _event() -> GatingEvent:
@@ -69,31 +56,12 @@ def _good_source(event: Any, ws: Path) -> Any:
     return build_artifact_spec(dest)
 
 
-def _seed_enabled(tmp: Path, image_ref: str = _IMAGE_REF, policy_id: str = "uat-neg") -> tuple[
-    PolicyStore, CalibrationStore, SeedProvenance
-]:
-    ps = PolicyStore(tmp / "p.db")
-    cs = CalibrationStore(tmp / "c.db")
-    good = (Fixture(
-        fixture_id="good", label=FixtureLabel.KNOWN_GOOD,
-        payload=(_CORPUS / "retry-good-v1" / "main.py").read_bytes(), evasion_class=None),)
-    bad = (Fixture(
-        fixture_id="bad", label=FixtureLabel.KNOWN_BAD,
-        payload=(_CORPUS / "retry-swallow-v1" / "main.py").read_bytes(),
-        evasion_class="exception-swallowing"),)
-    prov = seed_enabled_policy(
-        policy_store=ps, calibration_store=cs, policy_id=policy_id, detector_id="RetryCheck",
-        image_ref=image_ref, known_good=good, known_bad=bad,
-        budget=ResourceBudget(wall_clock_seconds=120.0), trials=1)
-    return ps, cs, prov
-
-
 def _wire_runner(
     ps: PolicyStore, cs: CalibrationStore, policy_id: str, detector_id: str, image_ref: str,
-    *, governance: Any = None, artifact_source: Any = None,
+    *, artifact_source: Any = None,
 ) -> Any:
     """Wire make_gated_job_runner EXACTLY as live_app.build()/the 2.1b adapter do (replica
-    resolve_disposition closure, snapshot=None), allowing a governance / artifact override."""
+    resolve_disposition closure, snapshot=None)."""
     from gate.gatekeeper import resolve_disposition
     from gate.live_app import _ProductionAdmissionGovernanceView
     from gate.pipeline import (
@@ -107,19 +75,14 @@ def _wire_runner(
             policy_id, store=ps, snapshot=None, snapshot_key=b"",
             now=time.time(), oracle_head_for=cs.set_head)
 
-    gov = governance if governance is not None else _ProductionAdmissionGovernanceView(ps, cs)
     src = artifact_source if artifact_source is not None else _good_source
     registry = default_detector_registry(
         detector_id=detector_id, entrypoint=DEFAULT_ENTRYPOINT,
         accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST)
     return make_gated_job_runner(
-        resolve_decision, src, policy_id=policy_id, governance=gov, image=image_ref,
+        resolve_decision, src, policy_id=policy_id,
+        governance=_ProductionAdmissionGovernanceView(ps, cs), image=image_ref,
         resolve=registry.resolve_bundle, detector_id=detector_id, trials=1, first_fail=True)
-
-
-# =====================================================================================
-# (b) + (e): engine-free refusals (no podman) — the refusal precedes the sandbox.
-# =====================================================================================
 
 
 class NonEnforceablePolicyTests(unittest.TestCase):
@@ -144,9 +107,8 @@ class NonEnforceablePolicyTests(unittest.TestCase):
         outcome = map_job_result(runner(_event()))
 
         self.assertEqual(outcome.result_kind, "non_run")
-        # a not-yet-enforceable policy is a NEUTRAL non-run (SKIP_NEUTRAL) — the engine did not run.
-        # (A DEGRADED policy — was-ENABLED, lost attestation — instead BLOCKs; that fail-closed edge
-        # is gated's disposition-map guarantee, exercised by the ABA test below reaching DEGRADED.)
+        # a never-enabled policy is a NEUTRAL non-run (SKIP_NEUTRAL) — the tautology contrast to the
+        # DEGRADED (was-ENABLED) scenario, which BLOCKs. The engine did not run either way.
         self.assertEqual(outcome.reason, Disposition.SKIP_NEUTRAL.value)
         self.assertEqual(outcome.gate_outcome, "neutral_gate")
 
@@ -188,115 +150,6 @@ class MisRoutedPlanTests(unittest.TestCase):
 
         with self.assertRaises(GateDecisionError):
             runner(_event())
-
-
-# =====================================================================================
-# (c) + (d) + (f): podman-gated refusals — each seeds a REAL ENABLED policy first.
-# =====================================================================================
-
-
-@unittest.skipUnless(
-    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
-)
-class CrossStoreAbaTests(unittest.TestCase):
-    def test_below_seam_generation_move_is_refused_policy_generation_moved(self) -> None:
-        # (c): a REAL cross-store ABA. A governance wrapper does the LIVE reads for real, then —
-        # after current_attestation captured the bound generation and inside oracle_head_for (which
-        # runs BEFORE the generation re-read) — commits a REAL ENABLED->DEGRADED transition that
-        # MOVES the policy's monotonic generation. set_head is untouched (a policy-tier move, not a
-        # fixture append), so the ABA bracket, not SET_HEAD_STALE, must catch it. admit_run_result's
-        # post-oracle generation re-read then differs from the bound one -> POLICY_GENERATION_MOVED.
-        from gate.authority import GovernanceApproval
-        from gate.live_app import _ProductionAdmissionGovernanceView
-        from gate.policy_state import PolicyState
-
-        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-neg-c-"))
-        ps, cs, prov = _seed_enabled(tmp)
-
-        # A DELEGATING wrapper (composition, not subclassing) around the REAL production view: it
-        # forwards every read to the real view unchanged, and — once, inside oracle_head_for (which
-        # admit_run_result calls between capturing the bound generation and re-reading it) — commits
-        # a REAL generation-moving transition. The reads it exposes are the real ones; only the
-        # timing of a genuine write is injected.
-        class _AbaGovernance:
-            def __init__(self, inner: Any) -> None:
-                self._inner = inner
-                self._fired = False
-
-            def current_attestation(self, policy_id: str) -> Any:
-                return self._inner.current_attestation(policy_id)
-
-            def oracle_head_for(self, set_id: str) -> Any:
-                head = self._inner.oracle_head_for(set_id)
-                if not self._fired:
-                    self._fired = True
-                    # a REAL write, sequenced through the real read path (never fabricated).
-                    ps.transition(
-                        prov.policy_id, PolicyState.DEGRADED,
-                        approval=GovernanceApproval(
-                            principals=("op",), purpose="uat-aba",
-                            rationale="move the policy generation mid-admission",
-                            operation_id="uat-aba-degrade"))
-                return head
-
-            def current_generation(self, policy_id: str) -> Any:
-                return self._inner.current_generation(policy_id)
-
-        governance = _AbaGovernance(_ProductionAdmissionGovernanceView(ps, cs))
-        runner = _wire_runner(
-            ps, cs, prov.policy_id, prov.detector_id, _IMAGE_REF, governance=governance)
-        outcome = map_job_result(runner(_event()))
-
-        self.assertEqual(outcome.result_kind, "blocking_refusal")
-        self.assertEqual(outcome.reason, "policy_generation_moved")
-
-
-@unittest.skipUnless(
-    _podman_image_available(_IMAGE_REF) and _podman_image_available(_IMAGE_REF_2),
-    f"{_IMAGE_REF} + {_IMAGE_REF_2} both required in the Podman image store",
-)
-class SubjectDriftTests(unittest.TestCase):
-    def test_enforcement_on_a_second_image_is_refused_subject_drift(self) -> None:
-        # (d): the artifact tree is SHA-bind-protected, so drift must be induced via the IMAGE
-        # coordinate. Calibrate the policy on _IMAGE_REF, then enforce on a DISTINCT image
-        # (_IMAGE_REF_2): the measured execution identity differs from the calibrated subject, so
-        # the measured composite != plan.target_subject -> admit_run_result refuses (SUBJECT_DRIFT).
-        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-neg-d-"))
-        ps, cs, prov = _seed_enabled(tmp, image_ref=_IMAGE_REF)
-
-        runner = _wire_runner(ps, cs, prov.policy_id, prov.detector_id, _IMAGE_REF_2)
-        outcome = map_job_result(runner(_event()))
-
-        self.assertEqual(outcome.result_kind, "blocking_refusal")
-        self.assertEqual(outcome.reason, "subject_drift")
-
-
-@unittest.skipUnless(
-    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
-)
-class ArtifactTamperTests(unittest.TestCase):
-    def test_sha_bind_tamper_is_an_infrastructure_failure(self) -> None:
-        # (f): a TOCTOU tamper — the artifact_source stages the tree, binds its tree_hash, then
-        # MUTATES a file AFTER hashing. The sandbox re-verifies the SHA-bind in prepare() and raises
-        # ArtifactHashMismatchError, which the runner maps to a blocking InfrastructureFailure —
-        # never a silent pass on altered bytes.
-        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-neg-f-"))
-        ps, cs, prov = _seed_enabled(tmp)
-
-        def _tampering_source(event: Any, ws: Path) -> Any:
-            from gate.artifact import build_artifact_spec
-            dest = ws / "src"
-            shutil.copytree(_CORPUS / "retry-good-v1", dest)
-            spec = build_artifact_spec(dest)  # binds the CLEAN tree hash
-            (dest / "main.py").write_text("# tampered after the tree hash was bound\n")
-            return spec
-
-        runner = _wire_runner(
-            ps, cs, prov.policy_id, prov.detector_id, _IMAGE_REF, artifact_source=_tampering_source)
-        outcome = map_job_result(runner(_event()))
-
-        self.assertEqual(outcome.result_kind, "infrastructure_failure")
-        self.assertEqual(outcome.reason, "artifact_integrity_mismatch")
 
 
 if __name__ == "__main__":
