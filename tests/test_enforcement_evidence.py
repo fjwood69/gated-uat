@@ -38,6 +38,7 @@ from orchestrator.enforcement_driver import (
     GatedEnforcementAdapter,
     seed_enabled_policy,
 )
+from orchestrator.expectations import ScenarioId
 from orchestrator.isolation import Registry
 
 _IMAGE_REF = "localhost/mori:local"
@@ -65,16 +66,11 @@ def _resolve_image_digest(image_ref: str) -> str | None:
     return image_id if image_id.startswith("sha256:") else "sha256:" + image_id
 
 
-@unittest.skip(
-    "rebuild [4] pending: enforce() still emits the pre-dissent v3 receipt shape, which the "
-    "reworked provenance-typed/scenario-specific schema v3 rejects. Reworked to the "
-    "scenario-driven prereg-first shape in rebuild unit [4]/[6]."
-)
 @unittest.skipUnless(
     _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
 )
 class EnforcementEvidenceTests(unittest.TestCase):
-    def test_compliant_run_yields_admitted_signed_v3_chain(self) -> None:
+    def test_compliant_admit_yields_admitted_signed_matrix_chain(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="mv-uat-enfev-"))
         ps = PolicyStore(tmp / "p.db")
         cs = CalibrationStore(tmp / "c.db")
@@ -90,18 +86,15 @@ class EnforcementEvidenceTests(unittest.TestCase):
             policy_store=ps, calibration_store=cs, policy_id="uat-enforce",
             detector_id="RetryCheck", image_ref=_IMAGE_REF, known_good=good, known_bad=bad,
             budget=ResourceBudget(wall_clock_seconds=120.0), trials=1)
-
-        image_digest = _resolve_image_digest(_IMAGE_REF)
-        self.assertIsNotNone(image_digest)
-        assert image_digest is not None
         signing_key = SigningKey.generate()
 
+        # [4]: prereg-first, scenario-driven; enforce() itself resolves the run-image config-ID and
+        # derives gated_commit from the pinned worktree (no caller-supplied strings).
         config = EnforcementRunConfig(
-            policy_store=ps, calibration_store=cs, seed=prov, image_ref=_IMAGE_REF,
-            toolchain_image_digest=image_digest, gated_commit="1d75d54",
-            # a COMPLIANT candidate tree: retry-good-v1 retries 3x → RetryCheck PASS under the
-            # observed backend (the same fixture the seed calibrated as known-good).
-            artifact_dir=_CORPUS / "retry-good-v1", signing_key=signing_key,
+            scenario=ScenarioId.COMPLIANT_ADMIT, policy_store=ps, calibration_store=cs, seed=prov,
+            image_ref=_IMAGE_REF,
+            # a COMPLIANT candidate tree: retry-good-v1 retries 3x → RetryCheck PASS.
+            artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs", signing_key=signing_key,
             verify_key=signing_key.verify_key, registry=Registry(tmp / "registry.db"),
             head_sha="a" * 40, trials=1, budget=ResourceBudget(wall_clock_seconds=120.0))
 
@@ -113,32 +106,39 @@ class EnforcementEvidenceTests(unittest.TestCase):
 
         # the signed v3 chain verifies AND is admissible via the harness's own public path.
         self.assertTrue(chain.is_admitted)
-        ep = chain.execution.payload
+        pp, ep = chain.prereg.payload, chain.execution.payload
+        self.assertEqual(pp["schema_version"], 3)
         self.assertEqual(ep["schema_version"], 3)
-        self.assertEqual(chain.prereg.payload["schema_version"], 3)
-        # the enforced policy is the PREREGISTERED one (semantic continuity binds them).
-        self.assertEqual(chain.prereg.payload["policy_id"], "uat-enforce")
+        # the PREREG is the signed prediction: scenario + configured policy + committed expectation.
+        self.assertEqual(pp["scenario"], "compliant_admit")
+        self.assertEqual(pp["configured_policy_id"], "uat-enforce")
+        self.assertEqual(pp["expected_kind"], "admitted_run")
+        self.assertEqual(pp["expected_reason"], "pass")
+        # the prereg was PERSISTED at mint (orphan-prereg audit).
+        self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
+        # continuity binds the execution to the preregistered context.
+        self.assertEqual(ep["scenario"], "compliant_admit")
+        self.assertEqual(ep["configured_policy_id"], "uat-enforce")
         self.assertEqual(ep["plan_policy_id"], "uat-enforce")
         self.assertEqual(ep["result_kind"], "admitted_run")
-        self.assertEqual(ep["result_sub_reason"], "")
         self.assertEqual(ep["gate_outcome"], "run_verdict")
-
-        # BOTH admission-bracket heads bound to the live governance the run was admitted against.
-        self.assertEqual(ep["policy_generation"], ps.policy_head("uat-enforce"))
-        self.assertEqual(ep["bound_oracle_head"], cs.set_head("default"))
+        self.assertEqual(ep["event_digest"], pp["rc_event_digest"])
+        # observed heads (renamed; post-read, no bracket claim).
+        self.assertEqual(ep["observed_policy_head_post_admission"], ps.policy_head("uat-enforce"))
         self.assertEqual(ep["bound_oracle_head"], prov.pinned_set_version)
-
-        # run-context coordinates the sandbox MEASURED (bare 64-hex digests).
+        # the run image the sandbox measured == the preregistered config-ID (belt + alarm).
+        self.assertEqual(ep["image_digest"], pp["rc_image_digest"])
+        self.assertTrue(ep["image_digest"].startswith("sha256:"))
+        # seed_trace binds the seed image (== run image here; distinct only for subject_drift).
+        self.assertEqual(ep["seed_trace"]["policy_id"], "uat-enforce")
+        self.assertEqual(ep["seed_trace"]["seed_image_digest"], prov.seed_image_digest)
+        # measured coordinates (bare 64-hex) + the sha256:<hex64> artifact tree hash.
         for field_name in (
             "resolved_profile_digest", "trust_policy_digest",
             "guard_policy_digest", "execution_identity_digest",
         ):
             self.assertEqual(len(ep[field_name]), 64, field_name)
-        # the artifact tree hash + image are sha256:<hex64> content addresses (what actually ran).
-        self.assertTrue(ep["artifact_tree_hash"].startswith("sha256:"))
         self.assertEqual(len(ep["artifact_tree_hash"]), 71)
-        self.assertTrue(ep["image_digest"].startswith("sha256:"))
-        self.assertEqual(ep["detector_id"], "RetryCheck")
 
 
 class WiringPinTests(unittest.TestCase):
