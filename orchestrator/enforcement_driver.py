@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -480,7 +481,19 @@ class GatedEnforcementAdapter:
                 from gate.artifact import build_artifact_spec
                 dest = ws / "src"
                 shutil.copytree(config.artifact_dir, dest)
-                spec = build_artifact_spec(dest)
+                return build_artifact_spec(dest)
+
+            # P1 (assembly-layer refutability): CAPTURE the bound tree_hash at the source-SELECTION
+            # seam — the ONE point every source flows through — NOT inside each source. A custom
+            # artifact_source (the ABA wrapper, the tamper source) that forgot to populate
+            # ``captured`` would kill receipt assembly with a KeyError on an ``admitted_run`` — the
+            # single most important observation an injection scenario can produce (the gate
+            # unexpectedly ADMITTING under the fault). Wrapping here makes tree_hash present by
+            # construction for EVERY source, so a refutation always serialises.
+            selected_source = config.artifact_source or default_source
+
+            def capturing_source(ev: Any, ws: Path) -> Any:
+                spec = selected_source(ev, ws)
                 captured["tree_hash"] = spec.tree_hash
                 return spec
 
@@ -488,7 +501,7 @@ class GatedEnforcementAdapter:
             # stores — never a substituted governance object. The ABA fault lives in the store
             # layer, so the real view reads THROUGH the wrapper's overridden accessor.
             gov = _ProductionAdmissionGovernanceView(ps, cs)
-            src = config.artifact_source or default_source
+            src = capturing_source
             registry = default_detector_registry(
                 detector_id=seed.detector_id, entrypoint=DEFAULT_ENTRYPOINT,
                 accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST)
@@ -535,11 +548,26 @@ class GatedEnforcementAdapter:
 
     def _persist_prereg(self, config: EnforcementRunConfig, run_id: str, prereg: Any) -> None:
         """Persist the SIGNED prereg to ``runs_dir/<run_id>/prereg.json`` at MINT, before the run —
-        so a propagated exception leaves a durable, signed record of what was predicted + attempted
-        (an orphan-prereg is the audit artifact for a crashed run)."""
+        so a propagated exception (or a CRASH) leaves a durable, signed record of what was predicted
+        + attempted (the orphan-prereg is the audit artifact for a crashed run). P2: the write is
+        CRASH-DURABLE — write to a temp sibling, fsync it, ``os.replace`` (atomic on POSIX), then
+        fsync the directory so the rename itself is durable. A crash mid-write can therefore never
+        leave a torn or absent prereg exactly when the audit record matters most (the stronger
+        'durable orphan audit' claim, not merely process-level persistence)."""
         d = config.runs_dir / run_id
         d.mkdir(parents=True, exist_ok=True)
-        (d / "prereg.json").write_text(json.dumps(receipt_to_dict(prereg), sort_keys=True))
+        data = json.dumps(receipt_to_dict(prereg), sort_keys=True)
+        tmp = d / "prereg.json.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, d / "prereg.json")  # atomic swap into place
+        dfd = os.open(d, os.O_DIRECTORY)  # fsync the dir so the rename survives a crash
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
 
     def _execution_receipt(
         self, config: EnforcementRunConfig, prereg: Any, gated_commit: str, event_digest: str,

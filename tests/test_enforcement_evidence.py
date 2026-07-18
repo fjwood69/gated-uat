@@ -386,6 +386,66 @@ class ShaTamperScenarioEvidenceTests(unittest.TestCase):
         self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
 
 
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class CustomSourceAdmittedRefutationTests(unittest.TestCase):
+    """The FIFTH permanent refutation fixture (P1 regression guard): the refutation channel must
+    serialise END-TO-END through a CUSTOM ``artifact_source`` — the path the ABA/tamper scenarios
+    use — on the single most important observation an injection scenario can produce: the gate
+    UNEXPECTEDLY ADMITTING under the fault. A custom source that bypassed the
+    ``captured['tree_hash']`` wiring the happy path populated would kill receipt ASSEMBLY with a
+    KeyError on that admitted result — silently breaking refutability for exactly the observation
+    that matters, while the other scenarios stay green (their expected refusal/infra shapes never
+    demand ``artifact_tree_hash``). Capture now happens at the source-SELECTION seam, so this holds
+    by construction.
+
+    Realised HONESTLY: a refusal-predicting scenario (NON_ENABLED_DEGRADED) is run with a CUSTOM
+    source but the policy left ENABLED (never degraded), so the REAL gate ADMITS. The prediction was
+    wrong; the harness must record that as a VALID signed chain that FAILS admissibility — not die
+    on a KeyError. (The four schema-layer round-trips proved refutations serialise per KIND; this
+    proves it per SOURCE-PATH at the assembly layer.)"""
+
+    def test_custom_source_admitted_result_is_a_valid_inadmissible_refutation(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-custom-admit-"))
+        ps, cs, prov = _seed(tmp)  # ENABLED — deliberately NOT degraded, so the gate will ADMIT
+        signing_key = SigningKey.generate()
+
+        def _plain_custom_source(event: Any, ws: Path) -> Any:
+            # a CUSTOM source that stages a compliant tree and does NOT touch ``captured`` — exactly
+            # the bypass the central capturing-wrap must cover.
+            from gate.artifact import build_artifact_spec
+            dest = ws / "src"
+            shutil.copytree(_CORPUS / "retry-good-v1", dest)
+            return build_artifact_spec(dest)
+
+        config = EnforcementRunConfig(
+            # predicts non_run/block_action_required, but the ENABLED policy + compliant tree ADMIT
+            scenario=ScenarioId.NON_ENABLED_DEGRADED, policy_store=ps, calibration_store=cs,
+            seed=prov, image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1",
+            runs_dir=tmp / "runs", signing_key=signing_key, verify_key=signing_key.verify_key,
+            registry=Registry(tmp / "registry.db"), head_sha="a" * 40, trials=1,
+            budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=_plain_custom_source)  # CUSTOM source; no fault_scheduler needed
+
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        # the gate ADMITTED (ENABLED + compliant) — the scenario's prediction (block) was REFUTED.
+        self.assertEqual(outcome.result_kind, "admitted_run")
+        self.assertEqual(outcome.outcome, "pass")
+        pp, ep = chain.prereg.payload, chain.execution.payload
+        # the chain SERIALISED through the custom-source path — the admitted coordinate that a
+        # tree_hash bypass would have KeyError'd is PRESENT (assembly-layer refutability holds).
+        self.assertEqual(ep["result_kind"], "admitted_run")
+        self.assertIn("artifact_tree_hash", ep)
+        self.assertTrue(ep["artifact_tree_hash"].startswith("sha256:"))
+        # ... and admissibility FAILS: admitted/pass != the predicted non_run/block_action_required.
+        self.assertFalse(chain.is_admitted)
+        self.assertEqual(pp["expected_kind"], "non_run")
+        self.assertEqual(pp["expected_reason"], "block_action_required")
+        self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
+
+
 class WiringPinTests(unittest.TestCase):
     """Structural-maintenance guard — no podman, no build() invocation. Pins production's decision
     wiring so a change forces re-verification of the adapter's replica closure."""

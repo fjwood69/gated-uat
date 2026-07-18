@@ -201,7 +201,7 @@ _ADMITTED_COORDS: frozenset[str] = frozenset(
     {
         "bound_oracle_head",                  # the calibration head the run was admitted against
         "observed_policy_head_post_admission",  # post-read policy head — NO bracket claim (amdt 4)
-        "artifact_tree_hash",                 # the ArtifactSpec.tree_hash the sandbox verified
+        "artifact_tree_hash",                 # the bound ArtifactSpec.tree_hash captured at binding
         "image_digest",                       # the OCI image BY DIGEST that executed
         "resolved_profile_digest",            # measured calibration coordinate 1
         "trust_policy_digest",                # measured calibration coordinate 2
