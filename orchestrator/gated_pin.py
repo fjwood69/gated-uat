@@ -15,6 +15,18 @@ _PINNED_COMMIT = "1d75d54a97986e18fae499c370f8615e6cf89e15"
 # Short form used in display-only contexts (error messages, receipts).
 _PINNED_COMMIT_SHORT = "1d75d54"
 
+# The INDEPENDENTLY-ACCEPTED RetryCheck profile digest at the pin — the literal captured in the
+# slice-2.0 provenance contract (goldens/pin_provenance.json → resolved_profile_digest), NOT a
+# value self-computed at runtime. Production supplies an externally-accepted digest so the gate
+# enforces the EXACT profile that was accepted; self-computing profile_of(...).digest() and feeding
+# it back to the same registry proves only self-consistency (the 2.0 circularity bug in miniature).
+# Injecting THIS literal into the seed + enforcement registries makes acceptance independent. A
+# drift (the runtime resolved digest ≠ this) fails detector resolution closed; a change to this
+# literal is a board decision, cross-checked against the golden by test_pin_contract.
+ACCEPTED_RETRYCHECK_PROFILE_DIGEST = (
+    "81bb684adfc63428b8280fe0d5596cc3a1c1c6446016d654f64ce7143d4d2fd5"
+)
+
 
 def verify_gated_dependency(gated_dir: Path) -> str:
     """Verify *gated_dir* is the pinned commit with a fully clean working tree.
