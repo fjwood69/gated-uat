@@ -93,6 +93,20 @@ class GatedContractStructureTests(unittest.TestCase):
             "golden) or ignorable (extend the frozenset). Do not auto-pass.",
         )
 
+    def test_accepted_profile_digest_matches_the_slice_2_0_golden(self) -> None:
+        # dissent P1 (independent acceptance): the digest the seed + enforcement registries inject
+        # as accepted_profile_digest MUST be the slice-2.0 golden literal, not a runtime
+        # self-computed value. Cross-check the two so a change to either is a caught board decision,
+        # and acceptance stays independent of the value the registry itself computes.
+        from orchestrator.gated_pin import ACCEPTED_RETRYCHECK_PROFILE_DIGEST
+
+        golden = json.loads(_GOLDEN.read_text())
+        self.assertEqual(
+            ACCEPTED_RETRYCHECK_PROFILE_DIGEST, golden["resolved_profile_digest"],
+            "the injected accepted RetryCheck profile digest drifted from the slice-2.0 provenance "
+            "contract — reconcile gated_pin.ACCEPTED_RETRYCHECK_PROFILE_DIGEST with the golden "
+            "(a board decision, not an auto-update).")
+
     def test_receipt_execution_key_set_is_frozen(self) -> None:
         # BOTH-DIRECTION equality against the full literal set: catches an ADDED receipt key (a
         # subset/presence check would silently miss it) as well as a removed one. A change to the

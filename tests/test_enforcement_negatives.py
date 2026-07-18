@@ -37,6 +37,7 @@ from orchestrator.enforcement_driver import (
     map_job_result,
     seed_enabled_policy,
 )
+from orchestrator.gated_pin import ACCEPTED_RETRYCHECK_PROFILE_DIGEST
 
 _IMAGE_REF = "localhost/mori:local"
 _IMAGE_REF_2 = "localhost/mori-uat:local"  # a DISTINCT image → a distinct execution identity
@@ -109,7 +110,8 @@ def _wire_runner(
     gov = governance if governance is not None else _ProductionAdmissionGovernanceView(ps, cs)
     src = artifact_source if artifact_source is not None else _good_source
     registry = default_detector_registry(
-        detector_id=detector_id, entrypoint=DEFAULT_ENTRYPOINT, accepted_profile_digest=None)
+        detector_id=detector_id, entrypoint=DEFAULT_ENTRYPOINT,
+        accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST)
     return make_gated_job_runner(
         resolve_decision, src, policy_id=policy_id, governance=gov, image=image_ref,
         resolve=registry.resolve_bundle, detector_id=detector_id, trials=1, first_fail=True)
@@ -177,7 +179,8 @@ class MisRoutedPlanTests(unittest.TestCase):
         ps = PolicyStore(tmp / "p.db")
         cs = CalibrationStore(tmp / "c.db")
         registry = default_detector_registry(
-            detector_id="RetryCheck", entrypoint=DEFAULT_ENTRYPOINT, accepted_profile_digest=None)
+            detector_id="RetryCheck", entrypoint=DEFAULT_ENTRYPOINT,
+            accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST)
         runner = make_gated_job_runner(
             lambda event: decision, _raising_source, policy_id="policy-B",
             governance=_ProductionAdmissionGovernanceView(ps, cs), image=_IMAGE_REF,

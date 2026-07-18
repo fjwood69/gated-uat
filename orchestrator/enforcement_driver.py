@@ -6,10 +6,13 @@ functions so the module imports without gated on ``sys.path``.
 
 FIDELITY (board-ratified): NO behaviour substitution in the sealed path. The adapter injects
 only RESOURCES (temp DB paths, fixtures, a seeded policy, the image, an adapter-owned store
-wrapper), each disclosed + signed in the receipt. The seed brings a policy to ENABLED through
-gated's REAL lifecycle (``run_calibration`` + ``ratify_enable``): the harness plays the OPERATOR
-role, it does not MANUFACTURE governance inputs — no direct rows, no shortcut pass, no
-hand-assembled subject or bound head.
+wrapper), each disclosed + signed in the receipt. The ENABLE decision is gated's, not the
+harness's: the seed brings a policy to ENABLED through gated's REAL lifecycle (``run_calibration``
++ ``ratify_enable``) — no shortcut pass, no hand-assembled subject or bound head; the store
+RECOVERS the enabled identity from the persisted calibration PASS. NARROWED claim (dissent P1):
+the calibration SET is populated via the store's append primitive under a capability + dual
+approval, NOT the full ``gate.admission.admit()`` fixture-admission ceremony — the seed stages a
+set to reach ENABLED, it does not exercise (or attest) fixture admission.
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from .evidence import (
     build_teardown_receipt,
     verify_integrity,
 )
+from .gated_pin import ACCEPTED_RETRYCHECK_PROFILE_DIGEST
 from .isolation import Registry, RunState
 from .runtime import compute_runtime_pack_digest, make_python_runtime_pack
 from .schemas import SCHEMA_VERSION_ENFORCEMENT
@@ -53,13 +57,21 @@ class EnforcementEvidenceError(RuntimeError):
 
 @dataclass(frozen=True)
 class SeedProvenance:
-    """How the seeded policy reached ENABLED — signed into the receipt so the evidence attests
-    'gated enforced THIS policy, brought to ENABLED via the real lifecycle over a real
-    calibration'. Every value is MEASURED by gated's real path, never harness-supplied."""
+    """How the seeded policy reached ENABLED. Fields are typed BY PROVENANCE (dissent P1 — no
+    blanket 'every value measured' claim):
 
+      CONFIGURED (harness inputs, not measured): ``policy_id``, ``detector_id``, ``set_id``.
+      MEASURED / STORE-DERIVED by gated's real lifecycle (the harness cannot author these): the
+      persisted-pass ``calibration_result_ref``, the sealed ``pinned_set_version`` (oracle head),
+      the RECOVERED ``subject`` (the enabled detector identity the store bound to the pass), and
+      the ``policy_head`` (the ENABLED tier-chain head / monotonic generation).
+    """
+
+    # --- configured (harness inputs) ---
     policy_id: str
     detector_id: str
     set_id: str
+    # --- measured / store-derived (gated's real lifecycle; not harness-authored) ---
     calibration_result_ref: str  # the persisted PASS ratify_enable anchored to
     pinned_set_version: str      # the sealed oracle head the pass is bound to
     subject: str                 # the measured detector identity the store RECOVERED and enabled
@@ -98,17 +110,20 @@ def seed_enabled_policy(
     from gate.authority import GovernanceApproval
     from gate.backends import guarded_backend
     from gate.calibration_store import AdmissionCapability, ChangeOp
-    from gate.detector_registry import DetectorRegistry, profile_of
+    from gate.detector_registry import DetectorRegistry
     from gate.gatekeeper import ratify_enable, run_calibration
     from gate.policy_state import PolicyState
     from gate.trust_policy import resolve_trust_policy
 
     retry_entry = ("python3", "/artifact/main.py")
-    detector = RetryCheck(retry_entry)
     registry = DetectorRegistry()
+    # INDEPENDENT acceptance (dissent P1): the accepted profile digest is the slice-2.0 golden
+    # LITERAL, not profile_of(...).digest() self-computed and fed back to the same registry (which
+    # proves only self-consistency). A runtime resolved-profile drift from this literal fails
+    # detector resolution closed — exactly as production's externally-accepted digest does.
     registry.register(
         detector_id, lambda: RetryCheck(retry_entry),
-        accepted_profile_digest=profile_of(detector_id, detector).digest(),
+        accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST,
     )
     make_sb, backend_guard = guarded_backend("observed", image_ref, guard_policy=guard_policy)
     trust_policy = resolve_trust_policy("trust-policy:completed-only")
@@ -120,8 +135,12 @@ def seed_enabled_policy(
             rationale="seed a real ENABLED policy via gated's lifecycle", operation_id=op,
         )
 
-    # Populate the set through the REAL admission path (dual approval + AdmissionCapability) so
-    # run_calibration seals a GENUINE set. Known-bad first: the sealed set iterates (*bad, *good).
+    # Populate the set via the CalibrationStore.append PRIMITIVE under an AdmissionCapability + dual
+    # GovernanceApproval (dissent P1: this does NOT traverse gate.admission.admit() — the full
+    # fixture-admission ceremony that validates each candidate executes cleanly, computes the
+    # known-good merged-tree hash, revokes the fallback and fires the re-cal outbox). The seed does
+    # not test fixture admission; it stages a set so run_calibration can seal + score it. Known-bad
+    # first: the sealed set iterates (*bad, *good).
     admit = AdmissionCapability()
     for fx in known_bad:
         calibration_store.append(
@@ -353,9 +372,11 @@ class GatedEnforcementAdapter:
             return spec
 
         governance = _ProductionAdmissionGovernanceView(ps, cs)
+        # INDEPENDENT acceptance (dissent P1): inject the slice-2.0 golden profile digest, not the
+        # self-computed one — the enforcement registry accepts the EXACT profile 2.0 pinned.
         registry = default_detector_registry(
             detector_id=config.seed.detector_id, entrypoint=DEFAULT_ENTRYPOINT,
-            accepted_profile_digest=None)
+            accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST)
         job_runner = make_gated_job_runner(
             resolve_decision, artifact_source, policy_id=policy_id, governance=governance,
             image=config.image_ref, resolve=registry.resolve_bundle,
