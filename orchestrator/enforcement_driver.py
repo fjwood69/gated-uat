@@ -573,16 +573,21 @@ class GatedEnforcementAdapter:
             self._fsync_dir(d.parent)  # the parent just gained d's entry — make it durable
 
     def _persist_prereg(self, config: EnforcementRunConfig, run_id: str, prereg: Any) -> None:
-        """Persist the SIGNED prereg to ``runs_dir/<run_id>/prereg.json`` at MINT, before the run —
-        so a propagated exception (or a CRASH) leaves a durable, signed record of what was predicted
-        + attempted (the orphan-prereg is the audit artifact for a crashed run). P2: the write is
-        CRASH-DURABLE the whole way down the tree — every directory the harness creates is fsynced
-        through its parent (``_mkdir_durable``), the file is written to a temp sibling + fsynced,
-        ``os.replace``d (atomic on POSIX), and ``<run_id>`` is fsynced so the rename INTO it is
-        durable. So a crash mid-mint can never lose the runs/ or <run_id>/ directory entry NOR leave
-        a torn/absent prereg exactly when the audit record matters most — the strong 'durable orphan
-        audit' claim, honoured link-by-link up to the pre-existing (assumed-durable) runs_dir
-        parent."""
+        """Persist the SIGNED prereg to ``runs_dir/<run_id>/prereg.json`` at MINT. The CONTRACT (not
+        a stronger, impossible claim): once ``_persist_prereg`` RETURNS, the prereg and its
+        directory chain are durable on disk; before it returns, the run has NOT started. That is the
+        orphan-audit property enforce() relies on — 'if execution began, the prediction is durably
+        recorded' — and it is the SUFFICIENT one. It is NOT (and cannot be) a promise that a crash
+        DURING persistence leaves a file: nothing guarantees that before ``os.replace`` lands, and a
+        crash before it simply leaves no target — which is fine, the run had not begun, so there is
+        nothing to audit.
+
+        P2 (what makes RETURN mean durable, the whole way down the tree): every directory the
+        harness creates is fsynced through its parent (``_mkdir_durable``), the file is written to a
+        temp sibling + fsynced, ``os.replace``d (atomic on POSIX — no reader sees a TORN prereg),
+        and ``<run_id>`` is fsynced so the rename INTO it is durable — link-by-link up to the
+        pre-existing (assumed-durable) runs_dir parent. So AFTER return, neither the runs/ nor
+        <run_id>/ directory entry nor the prereg can be lost to a crash."""
         d = config.runs_dir / run_id
         self._mkdir_durable(d)  # creates runs_dir + <run_id> as needed, parent-fsyncing each
         data = json.dumps(receipt_to_dict(prereg), sort_keys=True)
