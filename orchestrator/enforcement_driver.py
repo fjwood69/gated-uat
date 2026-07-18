@@ -102,8 +102,9 @@ def seed_enabled_policy(
     cannot rewrite the enabled identity). Registry / guarded-backend / trust-policy mirror the
     Phase-1 adapter.
 
-    Returns ``SeedProvenance`` (all values measured). Raises ``EnforcementSeedError`` if the
-    calibration did not PASS or the policy is not ENABLED afterwards.
+    Returns ``SeedProvenance`` (provenance-typed: CONFIGURED policy/set/detector IDs +
+    MEASURED/store-derived ref/head/subject/generation — not "all measured"). Raises
+    ``EnforcementSeedError`` if the calibration did not PASS or the policy is not ENABLED after.
     """
     from core.calibration import FixtureLabel
     from engine.retry import RetryCheck
