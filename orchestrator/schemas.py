@@ -282,6 +282,12 @@ class SchemaViolationError(ValueError):
     """Payload fails schema requirements for its receipt kind."""
 
 
+class SchemaCoherenceError(SchemaViolationError):
+    """A field-PAIR is internally contradictory within one observation — a record no honest mapper
+    could produce (e.g. gate_outcome contradicts the result_kind/result_reason the account()
+    union fixes). Integrity fails; NOT a value-vs-prediction mismatch (that is admissibility)."""
+
+
 # ------------------------------------------------------------------
 # Shared primitive validators
 # ------------------------------------------------------------------
@@ -531,18 +537,31 @@ def _validate_result_discriminator(payload: dict[str, Any]) -> str:
             f"result_kind: must be one of {sorted(VALID_RESULT_KINDS)}, got {kind!r}")
     if not _require(payload, "result_reason", types=(str,)):
         raise SchemaViolationError("result_reason: must be a non-empty audit token")
+    reason = str(payload["result_reason"])
     _require(payload, "result_sub_reason", types=(str,))  # may be empty
-    # gate_outcome — EXPLICIT null iff infra (the machinery failed before a verdict); else a known
-    # outcome. A gate outcome under an infra row is a provenance contradiction (integrity fail).
+    # gate_outcome COHERENCE with (result_kind, result_reason) — the closed gated ``account()``
+    # pairing written as schema law (total, no else-branch). gate_outcome DUPLICATES the disposition
+    # already in result_reason; a redundant field that is present-and-free is attack surface — an
+    # unbound copy could contradict the original (QM-2 silent fall-open: non_run +
+    # block_action_required paired with neutral_gate). Derived from the SEALED account() mapper
+    # (job_result.py: AdmittedRunResult/BlockingRefusal -> RUN_VERDICT; NonRunDecision ->
+    # BLOCK_GATE|NEUTRAL_GATE by disposition; InfrastructureFailure -> None) so any real
+    # map_job_result output validates and no honest observation is rejected.
     gate_outcome = payload.get("gate_outcome", "<absent>")
-    if kind == "infrastructure_failure":
-        if gate_outcome is not None:
-            raise SchemaViolationError(
-                "gate_outcome: an infrastructure_failure carries an explicit null (no verdict was "
-                "reliably produced) — a gate outcome here contradicts the provenance")
-    elif gate_outcome not in VALID_GATE_OUTCOMES:
-        raise SchemaViolationError(
-            f"gate_outcome: must be one of {sorted(VALID_GATE_OUTCOMES)}, got {gate_outcome!r}")
+    if kind == "non_run":
+        want: str | None = {
+            "block_action_required": "block_gate", "skip_neutral": "neutral_gate"}.get(reason)
+        if want is None:
+            raise SchemaCoherenceError(
+                f"non_run result_reason {reason!r} must be block_action_required or skip_neutral")
+    else:
+        want = {
+            "admitted_run": "run_verdict", "blocking_refusal": "run_verdict",
+            "infrastructure_failure": None}[kind]
+    if gate_outcome != want:
+        raise SchemaCoherenceError(
+            f"gate_outcome {gate_outcome!r} incoherent with {kind!r}/{reason!r} — account() "
+            f"requires {want!r}")
     # plan_policy_id — CAPTURED: an EXPLICIT null iff non_run (the SUT did not execute, so no plan
     # was captured); the captured plan's policy otherwise (never fabricated from the configured
     # policy). A captured plan under a non_run is a provenance contradiction (integrity fail).

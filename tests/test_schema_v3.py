@@ -27,6 +27,7 @@ from orchestrator.evidence import (
 )
 from orchestrator.expectations import ScenarioId, expected_for
 from orchestrator.schemas import (
+    SchemaCoherenceError,
     SchemaViolationError,
     validate_execution_payload_v3,
     validate_prereg_payload,
@@ -170,8 +171,10 @@ class SchemaMatrixTests(unittest.TestCase):
             for kind in ("admitted_run", "blocking_refusal", "non_run", "infrastructure_failure"):
                 with self.subTest(scenario=scenario, observed=kind):
                     outcome = "pass" if kind == "admitted_run" else "error"
+                    # non_run's reason must be a disposition token (coherent with its gate_outcome).
+                    reason = "block_action_required" if kind == "non_run" else "tok"
                     validate_execution_payload_v3(
-                        _exec(scenario, kind, result_reason="tok", outcome=outcome))
+                        _exec(scenario, kind, result_reason=reason, outcome=outcome))
 
     def test_fabricated_plan_on_non_run_is_integrity_violation(self) -> None:
         p = _exec(ScenarioId.NON_ENABLED_DEGRADED, "non_run", result_reason="block_action_required",
@@ -222,6 +225,47 @@ class AbaEvidenceTests(unittest.TestCase):
         p = _matched_exec(ScenarioId.ABA_GENERATION_MOVED)
         p["fault_injection"]["policy_head_post"] = _HEX  # == pre → generation did not move
         with self.assertRaises(SchemaViolationError):
+            validate_execution_payload_v3(p)
+
+
+class GateOutcomeCoherenceTests(unittest.TestCase):
+    """gate_outcome must be COHERENT with (result_kind, result_reason) — the sealed account()
+    pairing. A redundant field that can contradict the disposition it duplicates is the QM-2
+    silent fall-open."""
+
+    def test_degraded_block_paired_with_neutral_gate_is_rejected(self) -> None:
+        # THE fall-open the re-validation caught: a block disposition wearing a neutral gate. Kind +
+        # reason match the degraded expectation, so admissibility would pass — but no honest mapper
+        # produces block_action_required + neutral_gate, so integrity rejects it.
+        p = _exec(ScenarioId.NON_ENABLED_DEGRADED, "non_run", outcome="error",
+                  result_reason="block_action_required", gate_outcome="neutral_gate")
+        with self.assertRaises(SchemaCoherenceError):
+            validate_execution_payload_v3(p)
+
+    def test_neutral_disposition_paired_with_block_gate_is_rejected(self) -> None:
+        p = _exec(ScenarioId.NON_ENABLED_DEGRADED, "non_run", result_reason="skip_neutral",
+                  outcome="error", gate_outcome="block_gate")
+        with self.assertRaises(SchemaCoherenceError):
+            validate_execution_payload_v3(p)
+
+    def test_admitted_run_requires_run_verdict(self) -> None:
+        p = _exec(ScenarioId.COMPLIANT_ADMIT, "admitted_run", result_reason="all_retried",
+                  outcome="pass", gate_outcome="block_gate")
+        with self.assertRaises(SchemaCoherenceError):
+            validate_execution_payload_v3(p)
+
+    def test_blocking_refusal_gate_is_run_verdict_per_sealed_account(self) -> None:
+        # gated's account() maps BlockingRefusal -> RUN_VERDICT (job_result.py:152); block_gate here
+        # would reject the real map_job_result output, so run_verdict is the coherent value.
+        p = _exec(ScenarioId.ABA_GENERATION_MOVED, "blocking_refusal", outcome="error",
+                  result_reason="policy_generation_moved", gate_outcome="block_gate")
+        with self.assertRaises(SchemaCoherenceError):
+            validate_execution_payload_v3(p)
+
+    def test_non_run_reason_must_be_a_disposition_token(self) -> None:
+        p = _exec(ScenarioId.NON_ENABLED_DEGRADED, "non_run", result_reason="not_a_disposition",
+                  outcome="error", gate_outcome="block_gate")
+        with self.assertRaises(SchemaCoherenceError):
             validate_execution_payload_v3(p)
 
 

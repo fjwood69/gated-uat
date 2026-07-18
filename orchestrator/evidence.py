@@ -283,9 +283,13 @@ def validate_semantic_continuity(
     Raises SemanticContinuityError if:
     - profile is not identical across all three receipts
     - execution.gated_commit != prereg.gated_commit
-    - (v3 enforcement) execution.plan_policy_id != prereg.policy_id — the enforced policy
-      must be the PREREGISTERED one; a run cannot post-hoc choose which policy its signed
-      evidence attests to.
+    - (v3 enforcement, M3) the execution is bound to a DIFFERENT preregistered context — the
+      configured_policy_id or scenario differs; the event_digest != prereg.rc_event_digest; a
+      captured plan_policy_id != configured_policy_id; seed_trace.policy_id/detector_id are not the
+      configured policy / preregistered detector; the run image (image_digest for an admitted run /
+      drift_image_digest for subject_drift) != prereg.rc_image_digest; or (subject_drift) the seed
+      image == the run image (no distinct drift endpoint). This closes rebinding: a validly signed
+      execution cannot attest a context it did not preregister.
 
     Called from verify_integrity() after per-receipt checks complete.
     Also testable in isolation by passing Receipt objects directly.
