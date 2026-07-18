@@ -38,8 +38,10 @@ from orchestrator.enforcement_driver import (
     GatedEnforcementAdapter,
     seed_enabled_policy,
 )
-from orchestrator.expectations import ScenarioId
+from orchestrator.expectations import ScenarioId, expected_for
 from orchestrator.isolation import Registry
+
+from ._aba_scheduler import AbaInjectionScheduler
 
 _IMAGE_REF = "localhost/mori:local"
 _CORPUS = Path(__file__).resolve().parent.parent / "corpora" / "fixtures"
@@ -139,6 +141,90 @@ class EnforcementEvidenceTests(unittest.TestCase):
         ):
             self.assertEqual(len(ep[field_name]), 64, field_name)
         self.assertEqual(len(ep["artifact_tree_hash"]), 71)
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class AbaScenarioEvidenceTests(unittest.TestCase):
+    """The ABA_GENERATION_MOVED scenario end-to-end (slice 2.1 [5]): a TEST-ONLY store-layer
+    scheduler injects a cross-store ``set_head`` ABA across an ENABLED->DEGRADED generation move at
+    admission's live oracle read. Drives gated's REAL ``admit_run_result`` to a genuine
+    POLICY_GENERATION_MOVED refusal (NOT a fabricated JobResult), and asserts the harness emits a
+    signed schema-v3 refutation chain that its OWN admissibility path ACCEPTS — the prediction
+    (blocking_refusal / policy_generation_moved) was CONFIRMED. The fault disclosure is the
+    scheduler's COMPLETED induction record, demanded by ``enforce`` (a half-fired injection would
+    have raised and aborted evidence)."""
+
+    def test_aba_generation_move_yields_signed_admissible_refutation(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-aba-"))
+        ps = PolicyStore(tmp / "p.db")
+        cs = CalibrationStore(tmp / "c.db")
+        good = (Fixture(
+            fixture_id="good", label=FixtureLabel.KNOWN_GOOD,
+            payload=(_CORPUS / "retry-good-v1" / "main.py").read_bytes(), evasion_class=None),)
+        bad = (Fixture(
+            fixture_id="bad", label=FixtureLabel.KNOWN_BAD,
+            payload=(_CORPUS / "retry-swallow-v1" / "main.py").read_bytes(),
+            evasion_class="exception-swallowing"),)
+
+        prov = seed_enabled_policy(
+            policy_store=ps, calibration_store=cs, policy_id="uat-enforce",
+            detector_id="RetryCheck", image_ref=_IMAGE_REF, known_good=good, known_bad=bad,
+            budget=ResourceBudget(wall_clock_seconds=120.0), trials=1)
+        signing_key = SigningKey.generate()
+
+        # the ABA excursion fixture: a DISTINCT known-bad (id != the seed's "bad") whose ADD moves
+        # set_head H->H1 and whose DEPRECATE returns it H1->H — the genuine cross-store ABA.
+        scheduler = AbaInjectionScheduler(
+            real_cs=cs, policy_store=ps, policy_id="uat-enforce", set_id=prov.set_id,
+            artifact_dir=_CORPUS / "retry-good-v1",
+            fresh_fixture=Fixture(
+                fixture_id="aba-freshbad", label=FixtureLabel.KNOWN_BAD,
+                payload=(_CORPUS / "retry-swallow-v1" / "main.py").read_bytes(),
+                evasion_class="exception-swallowing"))
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.ABA_GENERATION_MOVED, policy_store=ps,
+            calibration_store=scheduler.calibration_store,  # WRAPPED; real view reads through it
+            seed=prov, image_ref=_IMAGE_REF,
+            artifact_dir=_CORPUS / "retry-good-v1",  # unused (artifact_source overrides); required
+            runs_dir=tmp / "runs", signing_key=signing_key, verify_key=signing_key.verify_key,
+            registry=Registry(tmp / "registry.db"), head_sha="a" * 40, trials=1,
+            budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=scheduler.artifact_source, fault_scheduler=scheduler)
+
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        # the below-seam ABA drove the REAL admission to POLICY_GENERATION_MOVED (a blocking
+        # refusal, NOT a fabricated result) — the generation bracket caught what set_head could not.
+        self.assertEqual(outcome.result_kind, "blocking_refusal")
+        self.assertEqual(outcome.reason, "policy_generation_moved")
+
+        # the scheduler COMPLETED a genuine ABA: real-read heads returned (H==H) after a real
+        # excursion (H1) across a real generation move — all values are anti-self-attesting reads.
+        disc = scheduler.require_completed_disclosure()
+        self.assertEqual(disc["head_bound"], disc["head_returned"])
+        self.assertNotEqual(disc["head_moved"], disc["head_bound"])
+        self.assertNotEqual(disc["policy_head_post"], disc["policy_head_pre"])
+
+        # the signed v3 chain verifies AND is ADMISSIBLE — the observed refutation CONFIRMS the
+        # signed prediction (expected == observed): what makes it evidence, not a mirror.
+        self.assertTrue(chain.is_admitted)
+        pp, ep = chain.prereg.payload, chain.execution.payload
+        self.assertEqual(pp["scenario"], "aba_generation_moved")
+        self.assertEqual(pp["expected_kind"], expected_for(ScenarioId.ABA_GENERATION_MOVED).kind)
+        self.assertEqual(pp["expected_reason"], "policy_generation_moved")
+        self.assertEqual(ep["result_kind"], "blocking_refusal")
+        self.assertEqual(ep["result_reason"], "policy_generation_moved")
+        # coherence law (sealed): a blocking_refusal is a completed run rejected at admission → it
+        # carries a real (admission) ERROR verdict, so gate_outcome is run_verdict not block_gate.
+        self.assertEqual(ep["gate_outcome"], "run_verdict")
+        # the fault disclosure in the receipt IS the scheduler's COMPLETED induction record (not a
+        # free config literal): what the harness actually did, gated on the injection completing.
+        self.assertEqual(ep["fault_injection"], disc)
+        # the prereg was PERSISTED at mint (orphan-prereg audit survives even a refused run).
+        self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
 
 
 class WiringPinTests(unittest.TestCase):
