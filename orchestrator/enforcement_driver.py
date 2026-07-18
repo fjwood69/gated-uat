@@ -18,6 +18,7 @@ set to reach ENABLED, it does not exercise (or attest) fixture admission.
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -76,6 +77,7 @@ class SeedProvenance:
     pinned_set_version: str      # the sealed oracle head the pass is bound to
     subject: str                 # the measured detector identity the store RECOVERED and enabled
     policy_head: str             # the ENABLED tier-chain head (the monotonic generation)
+    seed_image_digest: str       # the AUTHORITATIVE calibration-result execution image (sha256:...)
 
 
 def seed_enabled_policy(
@@ -182,10 +184,20 @@ def seed_enabled_policy(
         raise EnforcementSeedError(
             f"{policy_id!r} is not ENABLED after ratify_enable — the seed did not take",
         )
+    # M3/QM-3: the SEED image is the AUTHORITATIVE calibration-result execution identity —
+    # ``outcome.result.execution_identity.image_ref`` — NOT a caller string. Require a canonical
+    # ``sha256:<hex64>`` before returning (fail-closed); it anchors the SEED endpoint of a drift.
+    ei = outcome.result.execution_identity
+    seed_image = ei.image_ref if ei is not None else None
+    if not seed_image or not re.match(r"^sha256:[0-9a-f]{64}$", seed_image):
+        raise EnforcementSeedError(
+            f"seed calibration produced no canonical execution image digest (got {seed_image!r}) — "
+            "cannot anchor the seed image")
     return SeedProvenance(
         policy_id=policy_id, detector_id=detector_id, set_id=att[0],
         calibration_result_ref=outcome.calibration_result_ref, pinned_set_version=pinned,
         subject=att[2], policy_head=policy_store.policy_head(policy_id),
+        seed_image_digest=seed_image,
     )
 
 
