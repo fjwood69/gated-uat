@@ -62,6 +62,8 @@ from .schemas import (
     SCHEMA_VERSION_MIN_ADMIT,
     SIGNER_ROLE,
     SchemaViolationError,
+    enforcement_expected_triple,
+    enforcement_observed_triple,
     validate_payload,
 )
 from .trust import BadSignatureError, sign_receipt, verify_receipt_sig
@@ -302,16 +304,18 @@ def validate_semantic_continuity(
         raise SemanticContinuityError(
             f"gated_commit mismatch: prereg={prereg_commit!r} execution={exec_commit!r}"
         )
-    # v3 enforcement continuity: the enforced policy is bound to the preregistration.
+    # v3 enforcement continuity: the CONFIGURED policy and the SCENARIO are bound to the
+    # preregistration — a run cannot post-hoc choose which policy/scenario its signed evidence
+    # attests to. (The captured plan_policy_id is CAPTURED provenance, checked in the schema, not a
+    # continuity operand — a non_run legitimately has none.)
     if execution.payload.get("schema_version") == 3:
-        prereg_policy = prereg.payload.get("policy_id")
-        exec_policy = execution.payload.get("plan_policy_id")
-        if prereg_policy != exec_policy:
-            raise SemanticContinuityError(
-                f"enforced policy mismatch: prereg.policy_id={prereg_policy!r} != "
-                f"execution.plan_policy_id={exec_policy!r} — the run enforced a policy that was "
-                "not preregistered"
-            )
+        for _field in ("configured_policy_id", "scenario"):
+            pv = prereg.payload.get(_field)
+            ev = execution.payload.get(_field)
+            if pv != ev:
+                raise SemanticContinuityError(
+                    f"{_field} mismatch: prereg={pv!r} != execution={ev!r} — the run's "
+                    f"{_field} was not preregistered")
 
 
 # ------------------------------------------------------------------
@@ -472,13 +476,15 @@ def evaluate_admission(chain: VerifiedChain) -> bool:
     Accepts only a VerifiedChain — integrity must be verified before
     admission is checked. Callers cannot bypass verify_integrity().
 
-    Returns True when:
-    - execution.outcome is "pass" or "fail" (a UAT verdict, not infra error)
-    - teardown.failure is False (the run was cleanly torn down)
+    v1/v2 CALIBRATION: admissible when execution.outcome is "pass"/"fail" and teardown is clean.
 
-    A gated "fail" verdict IS admissible — it is evidence that the gate
-    correctly blocked a non-compliant promotion. An "error" outcome or a
-    failed teardown is NOT admissible (infrastructure failure, not a verdict).
+    v3 ENFORCEMENT (slice 2.1): admissibility is PREREGISTRATION-RELATIVE — the observation must
+    CONFIRM the signed prediction. Admissible iff teardown is clean AND the observed triple
+    (result_kind, reason, sub_reason) equals the preregistered ``expected`` triple AND the result is
+    not an ``infrastructure_failure``. So a predicted-and-observed governance refusal / non-run IS
+    admissible (the gate did what the scenario predicted), a REFUTED prediction (e.g. a predicted
+    block that came back neutral) FAILS, and an infrastructure_failure is NEVER admissible even when
+    predicted+matched — infra proves the plumbing held, not that the gate judged (S5 doctrine).
 
     Non-admissible chains should be logged rather than discarded; they are
     still cryptographically valid records of what happened.
@@ -486,9 +492,16 @@ def evaluate_admission(chain: VerifiedChain) -> bool:
     schema_ver = chain.execution.payload.get("schema_version", 0)
     if not isinstance(schema_ver, int) or schema_ver < SCHEMA_VERSION_MIN_ADMIT:
         return False
-    teardown_clean = not bool(chain.teardown.payload.get("failure", True))
-    execution_outcome = chain.execution.payload.get("outcome", "error")
-    return teardown_clean and execution_outcome in ("pass", "fail")
+    if bool(chain.teardown.payload.get("failure", True)):  # teardown must be clean
+        return False
+    if schema_ver == 3:
+        if chain.execution.payload.get("result_kind") == "infrastructure_failure":
+            return False  # amendment 3: infra is never enforcement evidence, even when predicted
+        return (
+            enforcement_observed_triple(chain.execution.payload)
+            == enforcement_expected_triple(chain.prereg.payload)
+        )
+    return chain.execution.payload.get("outcome", "error") in ("pass", "fail")
 
 
 # ------------------------------------------------------------------
