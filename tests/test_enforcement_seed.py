@@ -59,7 +59,8 @@ class EnforcementSeedTests(unittest.TestCase):
             budget=ResourceBudget(wall_clock_seconds=120.0), trials=1,
         )
 
-        # the policy is REALLY ENABLED, every provenance value measured (never harness-supplied)
+        # the policy is REALLY ENABLED; the MEASURED/store-derived provenance (ref/head/subject/
+        # generation) is present and not harness-authored (the IDs are configured inputs)
         self.assertIsInstance(prov, SeedProvenance)
         self.assertIs(ps.current_state("uat-enforce"), PolicyState.ENABLED)
         self.assertTrue(prov.subject and prov.calibration_result_ref and prov.policy_head)
