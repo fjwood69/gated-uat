@@ -315,9 +315,10 @@ class EnforcementRunConfig:
     ``gated_commit`` and the run-image digest are NOT caller inputs — ``enforce`` verifies the
     worktree and resolves the image config-ID itself, so the seam for a caller-supplied string does
     not exist. The scenario-specific injection seams default to the real production wiring (the
-    COMPLIANT_ADMIT path); the non-compliant scenarios inject their fault machinery (a governance
-    store-wrapper for ABA [5], a tampering artifact_source, a distinct run image) and disclose via
-    ``fault_injection`` — a record of what the harness ACTUALLY did, not a free config literal."""
+    COMPLIANT_ADMIT path); the non-compliant scenarios inject their fault machinery (a STORE-layer
+    calibration wrapper for ABA [5], a tampering artifact_source, a distinct run image) and disclose
+    via a scheduler-owned ``require_completed_disclosure()`` — a record of what the harness ACTUALLY
+    did, gated on the injection having COMPLETED, not a free config literal."""
 
     scenario: ScenarioId
     policy_store: Any
@@ -340,9 +341,16 @@ class EnforcementRunConfig:
     budget: ResourceBudget = field(
         default_factory=lambda: ResourceBudget(wall_clock_seconds=120.0))
     # scenario-specific injection seams (None => the real production wiring, COMPLIANT_ADMIT).
-    governance: Any = None          # [5] ABA store-wrapper; None => real production view
+    # NO ``governance`` seam (correction [4].1): enforce() ALWAYS constructs the real
+    # ``_ProductionAdmissionGovernanceView`` over the passed (possibly store-WRAPPED) stores — a
+    # substituted governance object is never admissible. The ABA fault is injected at the STORE
+    # layer (a calibration_store wrapper), which the real view reads THROUGH.
     artifact_source: Any = None     # tamper source; None => local staging source
-    fault_injection: dict[str, str] | None = None  # aba 5-head / tamper triple (REAL machinery)
+    # the fault DISCLOSURE is NOT a free config literal (correction [4].2): a fault-injecting
+    # scenario owns a ``fault_scheduler`` whose ``require_completed_disclosure()`` returns what it
+    # ACTUALLY did — but ONLY once its state machine reached COMPLETED. A half-fired injection
+    # raises there, aborting evidence rather than serialising a refusal over an unknown state.
+    fault_scheduler: Any = None     # [5] owns require_completed_disclosure(); aba/tamper only
 
 
 def _now_iso() -> str:
@@ -476,7 +484,10 @@ class GatedEnforcementAdapter:
                 captured["tree_hash"] = spec.tree_hash
                 return spec
 
-            gov = config.governance or _ProductionAdmissionGovernanceView(ps, cs)
+            # correction [4].1: ALWAYS the real production view over the passed (possibly WRAPPED)
+            # stores — never a substituted governance object. The ABA fault lives in the store
+            # layer, so the real view reads THROUGH the wrapper's overridden accessor.
+            gov = _ProductionAdmissionGovernanceView(ps, cs)
             src = config.artifact_source or default_source
             registry = default_detector_registry(
                 detector_id=seed.detector_id, entrypoint=DEFAULT_ENTRYPOINT,
@@ -492,9 +503,19 @@ class GatedEnforcementAdapter:
             # (h) map — observed_kind comes SOLELY from the JobResult, never the scenario.
             outcome = map_job_result(result)
 
+            # (h2) correction [4].2: for a fault-injecting scenario, DEMAND the scheduler's
+            # completion disclosure NOW. ``require_completed_disclosure()`` returns what was
+            # injected ONLY if its state machine reached COMPLETED; a half-fired injection RAISES,
+            # propagating to the except (run FAILED) and aborting evidence — never serialising a
+            # plausible refusal over an unknown-state fault.
+            fault_disclosure: dict[str, str] | None = None
+            if config.scenario in (ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SHA_TAMPER):
+                fault_disclosure = config.fault_scheduler.require_completed_disclosure()
+
             # (i) build the MATRIX execution receipt + (j) teardown + (k) index; verify.
             execution = self._execution_receipt(
-                config, prereg, gated_commit, event_digest, run_image_digest, outcome, captured)
+                config, prereg, gated_commit, event_digest, run_image_digest, outcome,
+                captured, fault_disclosure)
             # (j) correction 2: teardown records the HARNESS cleanup, which COMPLETED (the RAII
             # workspace was purged on every engine exit path). failure=False even for an
             # InfrastructureFailure JobResult (a completed SUT observation, NOT a dirty harness). A
@@ -523,11 +544,13 @@ class GatedEnforcementAdapter:
     def _execution_receipt(
         self, config: EnforcementRunConfig, prereg: Any, gated_commit: str, event_digest: str,
         run_image_digest: str, outcome: EnforcementOutcome, captured: dict[str, Any],
+        fault_disclosure: dict[str, str] | None,
     ) -> Any:
         """Build the signed MATRIX execution receipt (COMMON | configured(scenario) | observed).
         The observed fields are keyed by ``outcome.result_kind`` (the JobResult); the configured
-        / fault-injection fields by the scenario. plan_policy_id is the CAPTURED dispatched plan's
-        policy (or an explicit null for non_run)."""
+        / fault-injection fields by the scenario. ``fault_disclosure`` is the scheduler's COMPLETED
+        record of what the harness injected (aba/tamper), already demanded in ``enforce``.
+        plan_policy_id is the CAPTURED dispatched plan's policy (explicit null for non_run)."""
         seed, ps, scenario = config.seed, config.policy_store, config.scenario
         # plan_policy_id — CAPTURED: the dispatched plan's policy, or explicit None for a non_run.
         decision = captured.get("decision")
@@ -552,11 +575,11 @@ class GatedEnforcementAdapter:
             "seed_trace": _seed_trace(seed)}
         # CONFIGURED / FAULT-INJECTION by scenario — disclosed from the REAL machinery.
         if scenario in (ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SHA_TAMPER):
-            if config.fault_injection is None:
+            if fault_disclosure is None:
                 raise EnforcementEvidenceError(
-                    f"scenario {scenario.value!r} requires a fault_injection disclosure of what "
-                    "harness actually injected")
-            payload["fault_injection"] = dict(config.fault_injection)
+                    f"scenario {scenario.value!r} requires a COMPLETED fault disclosure from the "
+                    "scheduler (require_completed_disclosure produced nothing)")
+            payload["fault_injection"] = dict(fault_disclosure)
         elif scenario is ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE:
             # the CONFIGURED run image (== rc_image_digest; a DISTINCT image vs the seed).
             payload["drift_image_digest"] = run_image_digest
