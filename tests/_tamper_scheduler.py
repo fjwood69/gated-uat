@@ -62,7 +62,17 @@ class TamperInjectionScheduler:
             dest = workspace / "src"
             shutil.copytree(self._artifact_dir, dest)
             spec = build_artifact_spec(dest)  # binds the CLEAN tree hash
-            (dest / self._mutated_rel).write_bytes(self._mutation)  # mutate AFTER the bind
+            # mutate AFTER the bind (the TOCTOU). Independent no-op guard (dissent): assert the
+            # write ACTUALLY changed the bytes — a mutation equal to the original would leave the
+            # hash matching the mounted tree (a silent pass), so FAIL LOUD here rather than emit a
+            # tamper disclosure for a tamper that did not alter anything.
+            target = dest / self._mutated_rel
+            before = target.read_bytes()
+            target.write_bytes(self._mutation)
+            if target.read_bytes() == before:
+                raise EnforcementEvidenceError(
+                    f"tamper was a no-op: {self._mutated_rel} already equals the mutation, so the "
+                    "SHA-bind would still match the mounted tree — refusing to claim a tamper")
             # the sealed schema's fault_injection contract is the base disclosure TRIPLE
             # (locus / mechanism / interleaving_point) — all non-empty strings, no extra keys.
             self._disclosure = {

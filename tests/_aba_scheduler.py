@@ -181,40 +181,50 @@ class AbaInjectionScheduler:
     # --- determinism probe -------------------------------------------------------------------
 
     def _probe_determinism(self, set_id: str) -> None:
-        """Clone the real calibration DB via the SQLite ONLINE-BACKUP API (a raw file copy under WAL
-        could miss un-checkpointed frames) and run the SAME ADD->DEPRECATE on the clone, asserting
-        ``set_head`` returns byte-identical. Proves the ABA is deterministic in ISOLATION, before
-        the real store is touched — a disclosed manipulation check, not a self-attestation."""
+        """Clone the real calibration DB via the SQLite ONLINE-BACKUP API and run the SAME
+        ADD->DEPRECATE on the clone, asserting ``set_head`` returns byte-identical. Proves the ABA
+        is deterministic in ISOLATION, before the real store is touched — a disclosed manipulation
+        check, not a self-attestation.
+
+        WAL fidelity (dissent): the real store is ``journal_mode=WAL``, so committed membership can
+        live in un-checkpointed ``-wal`` frames. TRUNCATE-checkpoint the source FIRST (folds every
+        committed frame into the main db) so the online backup cannot capture a stale membership and
+        pass ``before == after`` trivially on the wrong baseline. The clone is removed on every exit
+        (it holds a copy of the calibration membership — evidence hygiene, not just a disk leak)."""
         clone_dir = Path(tempfile.mkdtemp(prefix="mv-aba-probe-"))
         clone_path = clone_dir / "clone.db"
-        src = sqlite3.connect(self._real._path)
         try:
-            dst = sqlite3.connect(str(clone_path))
+            src = sqlite3.connect(self._real._path)
             try:
-                src.backup(dst)
+                src.execute("PRAGMA wal_checkpoint(TRUNCATE)")  # committed WAL frames -> main db
+                dst = sqlite3.connect(str(clone_path))
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
             finally:
-                dst.close()
+                src.close()
+            clone = CalibrationStore(clone_path)
+            before = str(clone.set_head(set_id))
+            clone.append(
+                ChangeOp.ADD_KNOWN_BAD, admission=AdmissionCapability(),
+                approval=self._appr("probe-add"), fixture_id=self._fresh.fixture_id, set_id=set_id,
+                label=FixtureLabel.KNOWN_BAD, payload=self._fresh.payload,
+                evasion_class=self._fresh.evasion_class)
+            moved = str(clone.set_head(set_id))
+            clone.append(
+                ChangeOp.DEPRECATE_KNOWN_BAD, approval=self._appr("probe-deprecate"),
+                fixture_id=self._fresh.fixture_id, set_id=set_id)
+            after = str(clone.set_head(set_id))
+            if before != after:
+                raise EnforcementEvidenceError(
+                    f"determinism probe FAILED: ADD->DEPRECATE did not restore set_head "
+                    f"({before[:12]}.. != {after[:12]}..) on an independent clone — not determ.")
+            if moved == before:
+                raise EnforcementEvidenceError(
+                    "determinism probe: ADD_KNOWN_BAD did not move the clone set_head (no excurs.)")
         finally:
-            src.close()
-        clone = CalibrationStore(clone_path)
-        before = str(clone.set_head(set_id))
-        clone.append(
-            ChangeOp.ADD_KNOWN_BAD, admission=AdmissionCapability(),
-            approval=self._appr("probe-add"), fixture_id=self._fresh.fixture_id, set_id=set_id,
-            label=FixtureLabel.KNOWN_BAD, payload=self._fresh.payload,
-            evasion_class=self._fresh.evasion_class)
-        moved = str(clone.set_head(set_id))
-        clone.append(
-            ChangeOp.DEPRECATE_KNOWN_BAD, approval=self._appr("probe-deprecate"),
-            fixture_id=self._fresh.fixture_id, set_id=set_id)
-        after = str(clone.set_head(set_id))
-        if before != after:
-            raise EnforcementEvidenceError(
-                f"determinism probe FAILED: ADD->DEPRECATE did not restore set_head "
-                f"({before[:12]}.. != {after[:12]}..) on an independent clone — not deterministic")
-        if moved == before:
-            raise EnforcementEvidenceError(
-                "determinism probe: ADD_KNOWN_BAD did not move the clone's set_head (no excursion)")
+            shutil.rmtree(clone_dir, ignore_errors=True)
 
 
 class _AbaCalibrationStoreWrapper:
