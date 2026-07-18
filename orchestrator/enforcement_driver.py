@@ -18,8 +18,10 @@ set to reach ENABLED, it does not exercise (or attest) fixture admission.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -37,9 +39,11 @@ from .evidence import (
     build_index,
     build_receipt,
     build_teardown_receipt,
+    receipt_to_dict,
     verify_integrity,
 )
-from .gated_pin import ACCEPTED_RETRYCHECK_PROFILE_DIGEST
+from .expectations import ScenarioId, expected_for
+from .gated_pin import ACCEPTED_RETRYCHECK_PROFILE_DIGEST, verify_gated_dependency
 from .isolation import Registry, RunState
 from .runtime import compute_runtime_pack_digest, make_python_runtime_pack
 from .schemas import SCHEMA_VERSION_ENFORCEMENT
@@ -306,21 +310,22 @@ def map_job_result(result: Any) -> EnforcementOutcome:
 
 @dataclass(frozen=True)
 class EnforcementRunConfig:
-    """One live-enforcement run over an ALREADY-SEEDED pair of governance stores (see
-    ``seed_enabled_policy``). Everything gated's production ``build()`` binds from the environment
-    is supplied here explicitly (``build()`` is env/const-bound and cannot be parameterised), so the
-    harness hand-wires the SAME shape: the real ``_ProductionAdmissionGovernanceView``, a replica
-    ``resolve_disposition`` closure (snapshot=None, exactly as production), and a local
-    ArtifactSource that stages a candidate tree — a RESOURCE, not a behaviour substitution; the real
-    sandbox still SHA-binds and re-verifies it."""
+    """One live-enforcement run under a SCENARIO over an ALREADY-SEEDED pair of governance stores.
+    The harness hand-wires the SAME shape gated's env-bound ``build()`` does. Amendment 6: the
+    ``gated_commit`` and the run-image digest are NOT caller inputs — ``enforce`` verifies the
+    worktree and resolves the image config-ID itself, so the seam for a caller-supplied string does
+    not exist. The scenario-specific injection seams default to the real production wiring (the
+    COMPLIANT_ADMIT path); the non-compliant scenarios inject their fault machinery (a governance
+    store-wrapper for ABA [5], a tampering artifact_source, a distinct run image) and disclose via
+    ``fault_injection`` — a record of what the harness ACTUALLY did, not a free config literal."""
 
+    scenario: ScenarioId
     policy_store: Any
     calibration_store: Any
     seed: SeedProvenance
-    image_ref: str                  # OCI image the enforcement run executes (tag or digest)
-    toolchain_image_digest: str     # sha256:<hex64> the caller resolved (podman inspect) — bound
-    gated_commit: str               # short pin recorded in the receipts
+    image_ref: str                  # the RUN image TAG; enforce() resolves its immutable config-ID
     artifact_dir: Path              # local candidate source tree (the "PR head") to stage + run
+    runs_dir: Path                  # where the signed prereg is PERSISTED at mint (orphan audit)
     signing_key: SigningKey
     verify_key: VerifyKey
     registry: Registry
@@ -334,24 +339,75 @@ class EnforcementRunConfig:
     first_fail: bool = True
     budget: ResourceBudget = field(
         default_factory=lambda: ResourceBudget(wall_clock_seconds=120.0))
+    # scenario-specific injection seams (None => the real production wiring, COMPLIANT_ADMIT).
+    governance: Any = None          # [5] ABA store-wrapper; None => real production view
+    artifact_source: Any = None     # tamper source; None => local staging source
+    fault_injection: dict[str, str] | None = None  # aba 5-head / tamper triple (REAL machinery)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _compute_code_sha() -> str:
+    """A DETERMINISTIC content digest of the harness SOURCE (orchestrator/*.py) — a sorted map of
+    (filename -> sha256(source bytes)), hashed. Not the installed wheel (paths/.pyc are non-stable →
+    theatre); reproducible from the source tree. Labelled NON-authz in the receipt: identifies the
+    harness that made the prediction, it does not authorise anything."""
+    pkg = Path(__file__).resolve().parent
+    entries = [[p.name, hashlib.sha256(p.read_bytes()).hexdigest()]
+               for p in sorted(pkg.glob("*.py"))]
+    return hashlib.sha256(
+        json.dumps(entries, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _resolve_image_config_id(image_ref: str) -> str:
+    """Resolve *image_ref* to its immutable OCI image-config id (``sha256:<hex64>``, ``{{.Id}}``) —
+    the SAME coordinate gated's execution_identity binds. Launching by THIS id (not the mutable tag)
+    keeps the tag out of the trust path (correction 1 belt)."""
+    r = subprocess.run(
+        ["podman", "image", "inspect", "--format", "{{.Id}}", image_ref],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise EnforcementEvidenceError(
+            f"could not resolve image config-id for {image_ref!r}: {r.stderr.strip()}")
+    image_id = str(r.stdout.strip())
+    return image_id if image_id.startswith("sha256:") else "sha256:" + image_id
+
+
+def _event_digest(event: Any) -> str:
+    return str(canonical_digest("gated-uat-enforce-event", {
+        "delivery_id": event.delivery_id, "repo_full_name": event.repo_full_name,
+        "head_sha": event.head_sha, "action": event.action,
+        "installation_id": event.installation_id,
+        "head_repo_full_name": event.head_repo_full_name}, version=1))
+
+
+def _seed_trace(seed: SeedProvenance) -> dict[str, Any]:
+    return {
+        "policy_id": seed.policy_id, "detector_id": seed.detector_id, "set_id": seed.set_id,
+        "calibration_result_ref": seed.calibration_result_ref,
+        "pinned_set_version": seed.pinned_set_version, "subject": seed.subject,
+        "policy_head": seed.policy_head, "seed_image_digest": seed.seed_image_digest}
+
+
 class GatedEnforcementAdapter:
     """The SECOND gate/engine seam (beside ``GatedCalibrationAdapter``): drive gated's LIVE
-    ``make_gated_job_runner`` path exactly as ``live_app.build()`` wires it, then emit a signed
-    schema-v3 evidence chain. All ``gate.*`` imports are deferred into ``enforce`` so the module
-    imports without gated on ``sys.path``."""
+    ``make_gated_job_runner`` path exactly as ``live_app.build()`` wires it, PREREG-FIRST, then emit
+    a signed schema-v3 MATRIX evidence chain. All ``gate.*`` imports are deferred into ``enforce``
+    the module imports without gated on ``sys.path``."""
 
     def enforce(self, config: EnforcementRunConfig) -> tuple[EnforcementOutcome, VerifiedChain]:
-        """Run ONE delivery through the real job runner and return the mapped outcome + a VERIFIED
-        signed v3 chain. Wiring replicates production: replica ``resolve_disposition`` closure
-        (snapshot=None) capturing the immutable GateDecision for the receipt; local ArtifactSource
-        capturing the staged tree hash; the REAL ``_ProductionAdmissionGovernanceView``; the
-        reference detector registry (self-computed profile digest — matches the seed's profile)."""
+        """Run ONE delivery PREREG-FIRST and return the mapped outcome + a VERIFIED signed v3 chain.
+
+        The prereg (the signed PREDICTION) is minted, signed, and PERSISTED before ``job_runner`` is
+        invoked — so the observation can only confirm or refute a prior claim, and a crashed run
+        leaves a durable orphan-prereg audit. gated_commit is derived from the verified pinned
+        worktree; the run image is launched by its immutable config-ID (correction 1).
+        ``observed_kind``
+        comes SOLELY from the JobResult (``map_job_result``), never the scenario. teardown = the
+        HARNESS cleanup, not the SUT (correction 2)."""
+        import gate
         from gate.live_app import _ProductionAdmissionGovernanceView
         from gate.pipeline import (
             DEFAULT_ENTRYPOINT,
@@ -361,130 +417,157 @@ class GatedEnforcementAdapter:
         from gate.queue import GatingEvent
 
         ps, cs = config.policy_store, config.calibration_store
-        policy_id = config.seed.policy_id
-        captured: dict[str, Any] = {}
+        seed = config.seed
+        policy_id = seed.policy_id
 
-        def resolve_decision(event: Any) -> Any:
-            # EXACTLY the production closure (snapshot=None); capture the GateDecision (return it
-            # UNCHANGED, so behaviour is identical to production — capture is receipt-only).
-            from gate.gatekeeper import resolve_disposition
-            decision = resolve_disposition(
-                policy_id, store=ps, snapshot=None, snapshot_key=b"",
-                now=time.time(), oracle_head_for=cs.set_head)
-            captured["decision"] = decision
-            return decision
-
-        def artifact_source(event: Any, ws: Path) -> Any:
-            # inject a RESOURCE (the candidate tree) into the RAII workspace; the real sandbox
-            # SHA-binds + re-verifies. Capture the tree hash for the run-context receipt.
-            from gate.artifact import build_artifact_spec
-            dest = ws / "src"
-            shutil.copytree(config.artifact_dir, dest)
-            spec = build_artifact_spec(dest)
-            captured["tree_hash"] = spec.tree_hash
-            return spec
-
-        governance = _ProductionAdmissionGovernanceView(ps, cs)
-        # INDEPENDENT acceptance (dissent P1): inject the slice-2.0 golden profile digest, not the
-        # self-computed one — the enforcement registry accepts the EXACT profile 2.0 pinned.
-        registry = default_detector_registry(
-            detector_id=config.seed.detector_id, entrypoint=DEFAULT_ENTRYPOINT,
-            accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST)
-        job_runner = make_gated_job_runner(
-            resolve_decision, artifact_source, policy_id=policy_id, governance=governance,
-            image=config.image_ref, resolve=registry.resolve_bundle,
-            detector_id=config.seed.detector_id, trials=config.trials, budget=config.budget,
-            first_fail=config.first_fail)
+        # (a) verify the pinned gated worktree AT ENTRY and derive gated_commit there (amendment 6 —
+        # no caller-supplied commit string; the seam does not exist).
+        gated_root = Path(gate.__file__).resolve().parent.parent
+        gated_commit = verify_gated_dependency(gated_root)
+        # (b) resolve the RUN image config-ID — launched by THIS immutable id, not the tag (belt).
+        run_image_digest = _resolve_image_config_id(config.image_ref)
+        # (c) the deterministic harness code identity (non-authz).
+        code_sha = _compute_code_sha()
 
         event = GatingEvent(
             delivery_id=config.delivery_id, repo_full_name=config.repo_full_name,
             head_sha=config.head_sha, action=config.action,
             installation_id=config.installation_id)
-        result = job_runner(event)  # the CLOSED JobResult
-        outcome = map_job_result(result)
-        chain = self._build_chain(config, event, outcome, captured)
-        return outcome, chain
-
-    def _build_chain(
-        self, config: EnforcementRunConfig, event: Any, outcome: EnforcementOutcome,
-        captured: dict[str, Any],
-    ) -> VerifiedChain:
-        """Assemble the four-receipt signed v3 chain (prereg -> execution -> teardown -> index) and
-        return it VERIFIED. The enforcement bindings live in the execution receipt; the
-        admitted-only heads/coordinates/artifact are bound ONLY for an admitted_run."""
-        seed = config.seed
-        ps = config.policy_store
+        event_digest = _event_digest(event)
+        expected = expected_for(config.scenario)
         corpus_version = seed.pinned_set_version
-        corpus_digest = hashlib.sha256(corpus_version.encode()).hexdigest()
-        pack = make_python_runtime_pack(
-            toolchain_image_digest=config.toolchain_image_digest, corpus_digest=corpus_digest,
-            run_command=f"enforce {seed.detector_id}")
-        rpd = compute_runtime_pack_digest(pack)
+        rpd = compute_runtime_pack_digest(make_python_runtime_pack(
+            toolchain_image_digest=run_image_digest,
+            corpus_digest=hashlib.sha256(corpus_version.encode()).hexdigest(),
+            run_command=f"enforce {seed.detector_id}"))
         verify_key_hex = config.verify_key.encode().hex()
+
         run_id = config.registry.allocate()
         try:
+            # (e) MINT + SIGN + PERSIST the prereg BEFORE the run (orphan-prereg audit at mint).
             prereg_payload: dict[str, Any] = {
                 "schema_version": SCHEMA_VERSION_ENFORCEMENT, "profile": config.profile,
-                "gated_commit": config.gated_commit, "corpus_version": corpus_version,
-                "preregistered_at": _now_iso(), "policy_id": seed.policy_id}
+                "gated_commit": gated_commit, "corpus_version": corpus_version,
+                "preregistered_at": _now_iso(), "scenario": config.scenario.value,
+                "configured_policy_id": policy_id, "code_sha": code_sha,
+                "rc_event_digest": event_digest, "rc_image_ref": config.image_ref,
+                "rc_image_digest": run_image_digest, "rc_detector_id": seed.detector_id,
+                "expected_kind": expected.kind, "expected_reason": expected.reason,
+                "expected_sub_reason": expected.sub_reason}
             prereg = build_receipt("prereg", run_id, prereg_payload, config.signing_key)
+            self._persist_prereg(config, run_id, prereg)
 
-            event_digest = canonical_digest("gated-uat-enforce-event", {
-                "delivery_id": event.delivery_id, "repo_full_name": event.repo_full_name,
-                "head_sha": event.head_sha, "action": event.action,
-                "installation_id": event.installation_id,
-                "head_repo_full_name": event.head_repo_full_name}, version=1)
+            # (f) wire the REAL job runner, launched by the config-ID (belt).
+            captured: dict[str, Any] = {}
 
-            # LOAD-BEARING capture: bind plan_policy_id to the ACTUAL DISPATCHED decision the runner
-            # acted on (the GateDecision the replica closure captured), not a re-derived value. When
-            # a plan was minted (RUN_ENFORCING → admitted / refused) the receipt records THAT plan's
-            # policy; a non-run dispatched no plan, so the enforced policy is the configured target.
-            # Either way the dispatched policy MUST equal the configured one (the job runner's
-            # dispatch recheck guarantees it for a run that produced a JobResult); assert it so a
-            # mis-dispatch can never mint incoherent evidence.
-            decision = captured.get("decision")
-            dispatched_plan = getattr(decision, "plan", None) if decision is not None else None
-            plan_policy_id = (
-                dispatched_plan.policy_id if dispatched_plan is not None else seed.policy_id)
-            if plan_policy_id != seed.policy_id:
-                raise EnforcementEvidenceError(
-                    f"dispatched plan policy {plan_policy_id!r} != the enforced policy "
-                    f"{seed.policy_id!r} — refusing enforcement evidence for a mis-dispatch")
+            def resolve_decision(ev: Any) -> Any:
+                from gate.gatekeeper import resolve_disposition
+                decision = resolve_disposition(
+                    policy_id, store=ps, snapshot=None, snapshot_key=b"",
+                    now=time.time(), oracle_head_for=cs.set_head)
+                captured["decision"] = decision
+                return decision
 
-            exec_payload: dict[str, Any] = {
+            def default_source(ev: Any, ws: Path) -> Any:
+                from gate.artifact import build_artifact_spec
+                dest = ws / "src"
+                shutil.copytree(config.artifact_dir, dest)
+                spec = build_artifact_spec(dest)
+                captured["tree_hash"] = spec.tree_hash
+                return spec
+
+            gov = config.governance or _ProductionAdmissionGovernanceView(ps, cs)
+            src = config.artifact_source or default_source
+            registry = default_detector_registry(
+                detector_id=seed.detector_id, entrypoint=DEFAULT_ENTRYPOINT,
+                accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST)
+            job_runner = make_gated_job_runner(
+                resolve_decision, src, policy_id=policy_id, governance=gov,
+                image=run_image_digest, resolve=registry.resolve_bundle,
+                detector_id=seed.detector_id, trials=config.trials, budget=config.budget,
+                first_fail=config.first_fail)
+
+            # (g) run; an unexpected raise PROPAGATES (the persisted prereg is the orphan audit).
+            result = job_runner(event)
+            # (h) map — observed_kind comes SOLELY from the JobResult, never the scenario.
+            outcome = map_job_result(result)
+
+            # (i) build the MATRIX execution receipt + (j) teardown + (k) index; verify.
+            execution = self._execution_receipt(
+                config, prereg, gated_commit, event_digest, run_image_digest, outcome, captured)
+            # (j) correction 2: teardown records the HARNESS cleanup, which COMPLETED (the RAII
+            # workspace was purged on every engine exit path). failure=False even for an
+            # InfrastructureFailure JobResult (a completed SUT observation, NOT a dirty harness). A
+            # cleanup exception would have propagated already, leaving no completed chain.
+            teardown = build_teardown_receipt(execution, {
                 "schema_version": SCHEMA_VERSION_ENFORCEMENT, "profile": config.profile,
-                "gated_commit": config.gated_commit, "outcome": outcome.outcome,
-                "executed_at": _now_iso(), "canonical_digest_alg": "sha256",
-                "canonical_digest_version": 1, "plan_policy_id": plan_policy_id,
-                "result_kind": outcome.result_kind, "result_reason": outcome.reason,
-                "result_sub_reason": outcome.sub_reason, "event_digest": event_digest}
-            if outcome.gate_outcome is not None:
-                exec_payload["gate_outcome"] = outcome.gate_outcome
-            if outcome.admitted:
-                exec_payload.update({
-                    "bound_oracle_head": outcome.bound_oracle_head,
-                    "policy_generation": ps.policy_head(seed.policy_id),
-                    "artifact_tree_hash": captured["tree_hash"],
-                    "detector_id": outcome.detector_id, "image_digest": outcome.image_digest,
-                    "resolved_profile_digest": outcome.resolved_profile_digest,
-                    "trust_policy_digest": outcome.trust_policy_digest,
-                    "guard_policy_digest": outcome.guard_policy_digest,
-                    "execution_identity_digest": outcome.execution_identity_digest})
-            execution = build_execution_receipt(prereg, exec_payload, config.signing_key)
-
-            failed = outcome.result_kind == "infrastructure_failure"
-            teardown_payload: dict[str, Any] = {
-                "schema_version": SCHEMA_VERSION_ENFORCEMENT, "profile": config.profile,
-                "failure": failed, "torn_down_at": _now_iso(), "runtime_pack_digest": rpd}
-            if failed:
-                teardown_payload["error"] = outcome.reason
-            teardown = build_teardown_receipt(execution, teardown_payload, config.signing_key)
-
+                "failure": False, "torn_down_at": _now_iso(), "runtime_pack_digest": rpd},
+                config.signing_key)
             index = build_index(
                 run_id, prereg, execution, teardown, config.signing_key, verify_key_hex)
             chain = verify_integrity(prereg, execution, teardown, index, config.verify_key)
             config.registry.release(run_id, state=RunState.COMPLETED)
-            return chain
+            return outcome, chain
         except Exception:
             config.registry.release(run_id, state=RunState.FAILED)
             raise
+
+    def _persist_prereg(self, config: EnforcementRunConfig, run_id: str, prereg: Any) -> None:
+        """Persist the SIGNED prereg to ``runs_dir/<run_id>/prereg.json`` at MINT, before the run —
+        so a propagated exception leaves a durable, signed record of what was predicted + attempted
+        (an orphan-prereg is the audit artifact for a crashed run)."""
+        d = config.runs_dir / run_id
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "prereg.json").write_text(json.dumps(receipt_to_dict(prereg), sort_keys=True))
+
+    def _execution_receipt(
+        self, config: EnforcementRunConfig, prereg: Any, gated_commit: str, event_digest: str,
+        run_image_digest: str, outcome: EnforcementOutcome, captured: dict[str, Any],
+    ) -> Any:
+        """Build the signed MATRIX execution receipt (COMMON | configured(scenario) | observed).
+        The observed fields are keyed by ``outcome.result_kind`` (the JobResult); the configured
+        / fault-injection fields by the scenario. plan_policy_id is the CAPTURED dispatched plan's
+        policy (or an explicit null for non_run)."""
+        seed, ps, scenario = config.seed, config.policy_store, config.scenario
+        # plan_policy_id — CAPTURED: the dispatched plan's policy, or explicit None for a non_run.
+        decision = captured.get("decision")
+        dispatched_plan = getattr(decision, "plan", None) if decision is not None else None
+        if outcome.result_kind == "non_run":
+            plan_policy_id: str | None = None
+        else:
+            plan_policy_id = (
+                dispatched_plan.policy_id if dispatched_plan is not None else seed.policy_id)
+            if plan_policy_id != seed.policy_id:
+                raise EnforcementEvidenceError(
+                    f"dispatched plan policy {plan_policy_id!r} != enforced {seed.policy_id!r}")
+
+        payload: dict[str, Any] = {
+            "schema_version": SCHEMA_VERSION_ENFORCEMENT, "profile": config.profile,
+            "gated_commit": gated_commit, "outcome": outcome.outcome, "executed_at": _now_iso(),
+            "canonical_digest_alg": "sha256", "canonical_digest_version": 1,
+            "scenario": scenario.value, "configured_policy_id": seed.policy_id,
+            "event_digest": event_digest, "result_kind": outcome.result_kind,
+            "result_reason": outcome.reason, "result_sub_reason": outcome.sub_reason,
+            "gate_outcome": outcome.gate_outcome, "plan_policy_id": plan_policy_id,
+            "seed_trace": _seed_trace(seed)}
+        # CONFIGURED / FAULT-INJECTION by scenario — disclosed from the REAL machinery.
+        if scenario in (ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SHA_TAMPER):
+            if config.fault_injection is None:
+                raise EnforcementEvidenceError(
+                    f"scenario {scenario.value!r} requires a fault_injection disclosure of what "
+                    "harness actually injected")
+            payload["fault_injection"] = dict(config.fault_injection)
+        elif scenario is ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE:
+            # the CONFIGURED run image (== rc_image_digest; a DISTINCT image vs the seed).
+            payload["drift_image_digest"] = run_image_digest
+        # OBSERVED by kind — only an admitted run measured coordinates (authoritative return).
+        if outcome.result_kind == "admitted_run":
+            payload.update({
+                "bound_oracle_head": outcome.bound_oracle_head,
+                "observed_policy_head_post_admission": ps.policy_head(seed.policy_id),
+                "artifact_tree_hash": captured["tree_hash"], "image_digest": outcome.image_digest,
+                "resolved_profile_digest": outcome.resolved_profile_digest,
+                "trust_policy_digest": outcome.trust_policy_digest,
+                "guard_policy_digest": outcome.guard_policy_digest,
+                "execution_identity_digest": outcome.execution_identity_digest})
+        return build_execution_receipt(prereg, payload, config.signing_key)
