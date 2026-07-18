@@ -546,16 +546,45 @@ class GatedEnforcementAdapter:
             config.registry.release(run_id, state=RunState.FAILED)
             raise
 
+    @staticmethod
+    def _fsync_dir(path: Path) -> None:
+        """fsync a DIRECTORY (a path string cannot be fsynced — open a read fd first) so its most
+        recent entry change (a mkdir or a rename INTO it) is durable across a crash."""
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def _mkdir_durable(self, path: Path) -> None:
+        """``mkdir -p`` that fsyncs the PARENT of each directory it ACTUALLY creates — so every new
+        directory ENTRY is durable link-by-link up to the deepest PRE-EXISTING (assumed-durable)
+        ancestor. Fsyncing only the leaf is not enough: a directory is itself an entry in its
+        parent, so a freshly created ``runs/`` or ``<run_id>/`` whose parent was never fsynced can
+        vanish in a crash, taking the durably-written file inside it. An already-existing level is a
+        no-op (nothing to make durable)."""
+        to_create: list[Path] = []
+        p = path
+        while not p.exists():
+            to_create.append(p)
+            p = p.parent
+        for d in reversed(to_create):  # shallowest → deepest
+            d.mkdir()
+            self._fsync_dir(d.parent)  # the parent just gained d's entry — make it durable
+
     def _persist_prereg(self, config: EnforcementRunConfig, run_id: str, prereg: Any) -> None:
         """Persist the SIGNED prereg to ``runs_dir/<run_id>/prereg.json`` at MINT, before the run —
         so a propagated exception (or a CRASH) leaves a durable, signed record of what was predicted
         + attempted (the orphan-prereg is the audit artifact for a crashed run). P2: the write is
-        CRASH-DURABLE — write to a temp sibling, fsync it, ``os.replace`` (atomic on POSIX), then
-        fsync the directory so the rename itself is durable. A crash mid-write can therefore never
-        leave a torn or absent prereg exactly when the audit record matters most (the stronger
-        'durable orphan audit' claim, not merely process-level persistence)."""
+        CRASH-DURABLE the whole way down the tree — every directory the harness creates is fsynced
+        through its parent (``_mkdir_durable``), the file is written to a temp sibling + fsynced,
+        ``os.replace``d (atomic on POSIX), and ``<run_id>`` is fsynced so the rename INTO it is
+        durable. So a crash mid-mint can never lose the runs/ or <run_id>/ directory entry NOR leave
+        a torn/absent prereg exactly when the audit record matters most — the strong 'durable orphan
+        audit' claim, honoured link-by-link up to the pre-existing (assumed-durable) runs_dir
+        parent."""
         d = config.runs_dir / run_id
-        d.mkdir(parents=True, exist_ok=True)
+        self._mkdir_durable(d)  # creates runs_dir + <run_id> as needed, parent-fsyncing each
         data = json.dumps(receipt_to_dict(prereg), sort_keys=True)
         tmp = d / "prereg.json.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -563,11 +592,7 @@ class GatedEnforcementAdapter:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, d / "prereg.json")  # atomic swap into place
-        dfd = os.open(d, os.O_DIRECTORY)  # fsync the dir so the rename survives a crash
-        try:
-            os.fsync(dfd)
-        finally:
-            os.close(dfd)
+        self._fsync_dir(d)  # the rename INTO <run_id> is now durable
 
     def _execution_receipt(
         self, config: EnforcementRunConfig, prereg: Any, gated_commit: str, event_digest: str,
