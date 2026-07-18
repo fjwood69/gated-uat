@@ -122,3 +122,60 @@ generation race.
   bracket? If not, the genuine-ABA test may need a gated-side hook (a follow-up), and 2.1c's ABA
   negative is deferred with that dependency logged — better than shipping a generation-race mislabelled
   as ABA.
+
+---
+
+## REDESIGN of [2]/[3] — the (scenario, observed_kind) MATRIX (re-validation withdrawal)
+
+**Defect the first cut shipped:** `_SCENARIO_KIND` keyed the required execution fields to the
+scenario's *predicted* kind, so the schema became a CONFIRMATION FILTER — an ABA run that
+*unexpectedly admits* could not be serialised at all, and the one observation the prereg discipline
+exists to capture ("predicted block, it admitted") died at schema validation before
+`evaluate_admission` saw it. The instrument could only record agreement. Fix:
+
+**M1 — matrix.** Separate the two axes:
+- SCENARIO (what the HARNESS did) determines CONFIGURED + FAULT-INJECTION fields:
+  `seed_trace` (all scenarios), `fault_injection` (aba: base+5 heads; sha_tamper: base triple),
+  `drift_image_digest` (subject_drift).
+- OBSERVED `result_kind` (what the SUT PRODUCED) determines OBSERVED-RESULT fields:
+  `admitted_run` → the 8 measured coordinates; `blocking_refusal`/`non_run`/`infrastructure_failure`
+  → none. `plan_policy_id` = explicit null iff `non_run`; `gate_outcome` = explicit null iff
+  `infrastructure_failure`.
+- Exact key set = COMMON ∪ configured(scenario) ∪ observed(result_kind). EVERY closed kind is
+  representable under EVERY scenario. The schema NO LONGER checks scenario↔kind coherence — that was
+  the defect. `evaluate_admission` is the SOLE place expectation meets observation.
+
+**M2 — prereg bound to the authored fixture (P1b).** `validate_prereg_payload` asserts the expected
+triple `== expected_for(ScenarioId(scenario))` EXACTLY (unit [1]'s authored authority was never
+consumed; authority unconsumed is authority absent). Add prereg-tamper negatives. Also add
+`rc_image_digest` (sha256:, resolved pre-run) so image identity is continuable.
+
+**M3 — continuity binds run context (P1c, fork-4 rebindability).** `validate_semantic_continuity` v3:
+`execution.event_digest == prereg.rc_event_digest`; `plan_policy_id == configured_policy_id` when
+present; `seed_trace.policy_id == configured_policy_id`; `seed_trace.detector_id ==
+prereg.rc_detector_id`; and the run image (`image_digest` for admitted / `drift_image_digest` for
+subject_drift) `== prereg.rc_image_digest`.
+
+**M4 — ABA evidence non-degenerate (P2).** The 5 heads are hex64 (not merely non-empty), and the
+schema asserts the ABA shape: `head_bound == head_returned`, `head_moved != head_bound`,
+`policy_head_pre != policy_head_post`. Tests narrow `assertRaises(Exception)` → `SemanticContinuityError`.
+
+**Acceptance floor — the signed-refutation round-trip.** For each of {aba-admits, degraded-admits,
+degraded-neutrals, tamper-admits}: a chain minted (predicts X) + observed (Y≠X) must
+`verify_integrity` PASS (an honest record) and `evaluate_admission` FAIL (a recorded refutation). The
+harness must prove it can write down its own falsification before [4] proceeds.
+
+### Open questions for /consult (redesign)
+- **QM-1:** Are there `(scenario, observed_kind)` cells that are PHYSICALLY impossible (the harness
+  could never produce them) — and if so should the schema reject them, or stay permissive and let
+  admissibility fail? (Permissive keeps the schema a pure recorder; rejecting re-introduces a
+  confirmation-filter risk. Lean permissive — but is any cell a genuine integrity violation, e.g. a
+  `non_run` carrying a captured plan?)
+- **QM-2:** The degraded-neutrals refutation: a DEGRADED policy that silently neutrals yields observed
+  `(non_run, "skip_neutral", "")` vs expected `(non_run, "block_action_required", "")` → admission
+  fails. Is comparing the disposition token the right granularity to catch silent-fall-open, or is a
+  coarser kind-only compare a hole?
+- **QM-3:** Image continuity for subject_drift binds `drift_image_digest == rc_image_digest` — i.e.
+  the prereg's `rc_image_digest` is the RUN (drift) image, while the SEED ran on a different image.
+  Is preregistering the run image (not the seed image) the honest choice, and does anything need to
+  bind the seed image too?

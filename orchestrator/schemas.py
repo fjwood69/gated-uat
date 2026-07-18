@@ -12,14 +12,16 @@ Schema versions:
   v3 (Phase 2, slice 2.1 — LIVE ENFORCEMENT, provenance-typed & scenario-specific): the PREREG is
       the signed PREDICTION, minted before the run — it commits ``scenario`` +
       ``configured_policy_id`` + ``code_sha`` + the pre-run run context + the ``expected`` triple.
-      The EXECUTION receipt is provenance-typed (configured / observed / captured / seed_trace /
-      fault_injection) and SCENARIO-SPECIFIC: its exact key set is the common set plus the
-      scenario's observed set, and it signs ONLY what the scenario produced — an admitted run its
-      measured coordinates, a subject-drift refusal the configured second-image identity (NO
-      drifted measured coords), an ABA / tamper the signed ``fault_injection``. ``plan_policy_id``
-      is an EXPLICIT null when no plan was captured. Admissibility = the observed triple equals the
-      preregistered expected triple, and an infrastructure_failure is never admissible.
-      Teardown/index are the v2 shape at version 3.
+      The EXECUTION receipt is provenance-typed via the (scenario, observed_kind) MATRIX: its exact
+      key set is COMMON | configured(scenario) | observed(result_kind). The SCENARIO governs the
+      configured / fault-injection fields (what the harness did); the OBSERVED result_kind governs
+      the observed-result fields (what the SUT produced) — so EVERY kind is representable under
+      EVERY scenario and a refutation (an ABA that unexpectedly admits) is a well-formed record, not
+      an unrepresentable one. ``plan_policy_id`` is an EXPLICIT null iff non_run;
+      ``gate_outcome`` an
+      explicit null iff infra. Integrity checks provenance consistency; admissibility (the observed
+      triple == the preregistered expected triple, and never an infra failure) is the SOLE
+      value-vs-prediction check. Teardown/index are the v2 shape at version 3.
 
 Version dispatch:
   validate_payload(kind, payload) reads schema_version from the payload and
@@ -35,7 +37,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .expectations import ScenarioId
+from .expectations import ScenarioId, expected_for
 
 SCHEMA_VERSION = 2  # current / latest CALIBRATION receipt version (Phase 1)
 SCHEMA_VERSION_ENFORCEMENT = 3  # LIVE-ENFORCEMENT execution receipt (Phase 2, slice 2.1)
@@ -88,7 +90,8 @@ _PREREG_KEYS_V3: frozenset[str] = _PREREG_KEYS | {
     "configured_policy_id",    # CONFIGURED — the policy the run targets (universal; was policy_id)
     "code_sha",                # package-byte digest of the harness — NON-authz identity (labelled)
     "rc_event_digest",         # run-context: digest of the GatingEvent (pre-run knowable)
-    "rc_image_ref",            # run-context: the image chosen pre-run
+    "rc_image_ref",            # run-context: the image tag chosen pre-run
+    "rc_image_digest",         # run-context: the RESOLVED sha256:<hex64> run image (continuity)
     "rc_detector_id",          # run-context: the detector chosen pre-run
     "expected_kind",           # the committed prediction: JobResult class
     "expected_reason",         # the committed prediction: closed reason token (admitted → outcome)
@@ -144,7 +147,7 @@ _EXECUTION_KEYS_V2: frozenset[str] = frozenset(
 #   SEED_TRACE — seed_trace: the signed SeedProvenance (how the policy reached ENABLED).
 #
 # The COMMON set below is present in EVERY enforcement execution receipt; the scenario-specific
-# observed set is added per scenario (see _SCENARIO_OBSERVED). An admitted run binds its measured
+# observed set is added per the matrix (see _OBSERVED_FIELDS). An admitted run binds its measured
 # coordinates; a refusal/non-run/infra binds only what it observed — no fabricated measurement, and
 # (amendment 4) NEVER measured coordinates read off the mutable, non-authoritative report sink.
 _EXECUTION_V3_COMMON: frozenset[str] = frozenset(
@@ -173,9 +176,28 @@ _EXECUTION_V3_COMMON: frozenset[str] = frozenset(
         "seed_trace",
     }
 )
+# --- the (scenario, observed_kind) MATRIX (re-validation redesign) ------------------------------
+# The prior cut keyed required fields to the scenario's PREDICTED kind — a CONFIRMATION FILTER that
+# could not serialise a refutation (an ABA that unexpectedly admits). The two axes are now SEPARATE:
+#   SCENARIO   -> the CONFIGURED + FAULT-INJECTION fields (what the HARNESS did).
+#   OBSERVED   -> the OBSERVED-RESULT fields (what the SUT PRODUCED), keyed by result_kind.
+# Exact key set = COMMON | configured(scenario) | observed(result_kind). EVERY closed kind is
+# representable under EVERY scenario; the schema does NOT check scenario<->kind coherence (that WAS
+# the defect). Integrity = a well-formed, provenance-consistent record; evaluate_admission ALONE
+# compares observed-vs-expected.
+
+# CONFIGURED / FAULT-INJECTION fields, keyed by SCENARIO (present whatever the SUT then did).
+_SCENARIO_CONFIGURED: dict[str, frozenset[str]] = {
+    ScenarioId.COMPLIANT_ADMIT.value: frozenset(),
+    ScenarioId.NON_ENABLED_DEGRADED.value: frozenset(),
+    ScenarioId.ABA_GENERATION_MOVED.value: frozenset({"fault_injection"}),
+    ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE.value: frozenset({"drift_image_digest"}),
+    ScenarioId.SHA_TAMPER.value: frozenset({"fault_injection"}),
+}
+
 # The measured coordinates only an ADMITTED run produces (from the authoritative engine return, not
-# the mutable report sink). Bound ONLY for the compliant_admit scenario.
-_EXECUTION_V3_ADMITTED_FIELDS: frozenset[str] = frozenset(
+# the mutable report sink). OBSERVED-RESULT fields, keyed by the OBSERVED result_kind.
+_ADMITTED_COORDS: frozenset[str] = frozenset(
     {
         "bound_oracle_head",                  # the calibration head the run was admitted against
         "observed_policy_head_post_admission",  # post-read policy head — NO bracket claim (amdt 4)
@@ -187,21 +209,18 @@ _EXECUTION_V3_ADMITTED_FIELDS: frozenset[str] = frozenset(
         "execution_identity_digest",          # measured calibration coordinate 4
     }
 )
-# The scenario-specific OBSERVED fields (added to the common set). Each scenario signs exactly what
-# it produced: an admitted run its measured coordinates; a subject-drift refusal the CONFIGURED
-# second-image identity + refusal reason (NO measured coords — amendment 4); an ABA / tamper the
-# signed fault_injection sub-object.
-_SCENARIO_OBSERVED: dict[str, frozenset[str]] = {
-    ScenarioId.COMPLIANT_ADMIT.value: _EXECUTION_V3_ADMITTED_FIELDS,
-    ScenarioId.NON_ENABLED_DEGRADED.value: frozenset(),
-    ScenarioId.ABA_GENERATION_MOVED.value: frozenset({"fault_injection"}),
-    ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE.value: frozenset({"drift_image_digest"}),
-    ScenarioId.SHA_TAMPER.value: frozenset({"fault_injection"}),
+_OBSERVED_FIELDS: dict[str, frozenset[str]] = {
+    "admitted_run": _ADMITTED_COORDS,       # measured coordinates from the authoritative return
+    "blocking_refusal": frozenset(),        # a refusal exposes NO authoritative report (amdt 4)
+    "non_run": frozenset(),                 # nothing ran
+    "infrastructure_failure": frozenset(),  # the machinery failed before a verdict
 }
-# Nested signed sub-object key sets.
+
+# Nested signed sub-object key sets. seed_image_digest (from the calibration result's
+# execution_identity) anchors the SEED endpoint of a drift (M3/QM-3).
 _SEED_TRACE_KEYS: frozenset[str] = frozenset(
     {"policy_id", "detector_id", "set_id", "calibration_result_ref",
-     "pinned_set_version", "subject", "policy_head"}
+     "pinned_set_version", "subject", "policy_head", "seed_image_digest"}
 )
 # fault_injection disclosure — locus/mechanism/interleaving_point ALWAYS; the ABA scheduler also
 # signs the FIVE heads (the movement trace: bind H, moved H1, returned H, + scheduler-observed
@@ -213,10 +232,15 @@ _FAULT_INJECTION_ABA_KEYS: frozenset[str] = _FAULT_INJECTION_BASE_KEYS | {
 }
 
 
-def execution_keys_for_scenario(scenario: str) -> frozenset[str]:
-    """The EXACT key set a v3 execution receipt must carry for *scenario* (common + the scenario's
-    observed set). Unknown scenario → the common set only, which fails scenario validation."""
-    return _EXECUTION_V3_COMMON | _SCENARIO_OBSERVED.get(scenario, frozenset())
+def execution_keys_for(scenario: str, observed_kind: str) -> frozenset[str]:
+    """The EXACT key set a v3 execution receipt must carry for (scenario, observed_kind): the common
+    set + the scenario's configured/fault fields + the observed kind's result fields. Every closed
+    kind is representable under every scenario (no confirmation filter)."""
+    return (
+        _EXECUTION_V3_COMMON
+        | _SCENARIO_CONFIGURED.get(scenario, frozenset())
+        | _OBSERVED_FIELDS.get(observed_kind, frozenset())
+    )
 
 
 _TEARDOWN_KEYS_V1: frozenset[str] = frozenset(
@@ -379,6 +403,7 @@ def validate_prereg_payload(payload: dict[str, Any]) -> None:
                 raise SchemaViolationError(f"{_field}: must be non-empty in a v3 prereg")
         _require_hex64(payload, "code_sha")        # package-byte digest (labelled non-authz)
         _require_hex64(payload, "rc_event_digest")
+        _require_sha256_prefixed(payload, "rc_image_digest")  # the resolved run-image anchor
         # the committed prediction — a closed JobResult kind + non-empty reason token + sub_reason.
         expected_kind = _require(payload, "expected_kind", types=(str,))
         if expected_kind not in VALID_RESULT_KINDS:
@@ -387,6 +412,17 @@ def validate_prereg_payload(payload: dict[str, Any]) -> None:
         if not _require(payload, "expected_reason", types=(str,)):
             raise SchemaViolationError("expected_reason: must be a non-empty closed token")
         _require(payload, "expected_sub_reason", types=(str,))  # may be empty
+        # M2 — BIND THE AUTHORED CANON: the committed prediction MUST equal the authored fixture for
+        # this scenario, so a doctored prereg with a convenient expected triple is rejected. This
+        # is the fixture-canon check at PREREG validation; admissibility compares the observation
+        # against the SIGNED FROZEN prereg (never recomputes expected_for) — no self-confirmation.
+        canon = expected_for(ScenarioId(scenario))
+        got = (payload["expected_kind"], payload["expected_reason"], payload["expected_sub_reason"])
+        if got != (canon.kind, canon.reason, canon.sub_reason):
+            raise SchemaViolationError(
+                f"expected triple {got} != the authored fixture "
+                f"{(canon.kind, canon.reason, canon.sub_reason)} for scenario {scenario!r} "
+                "(the prereg was not authored from the canonical expectation)")
 
 
 # ------------------------------------------------------------------
@@ -466,17 +502,6 @@ def validate_execution_payload_v2(payload: dict[str, Any]) -> None:
             _require(payload, "policies_consistent", types=(bool,))
 
 
-# Each scenario implies exactly one JobResult kind — a receipt claiming scenario X with a
-# result_kind that scenario cannot produce is incoherent (caught below).
-_SCENARIO_KIND: dict[str, str] = {
-    ScenarioId.COMPLIANT_ADMIT.value: "admitted_run",
-    ScenarioId.NON_ENABLED_DEGRADED.value: "non_run",
-    ScenarioId.ABA_GENERATION_MOVED.value: "blocking_refusal",
-    ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE.value: "blocking_refusal",
-    ScenarioId.SHA_TAMPER.value: "infrastructure_failure",
-}
-
-
 def _require_nested(payload: dict[str, Any], key: str, allowed: frozenset[str], name: str) -> Any:
     """Require a nested signed sub-object with EXACTLY *allowed* keys (equality, not subset)."""
     obj = _require(payload, key, types=(dict,))
@@ -493,68 +518,118 @@ def _require_nonempty_str_fields(obj: dict[str, Any], keys: frozenset[str], name
             raise SchemaViolationError(f"{name}.{k}: must be a non-empty string")
 
 
-def _validate_result_discriminator(payload: dict[str, Any], scenario: str) -> str:
-    """Validate the CLOSED discriminator + the CAPTURED plan_policy_id (explicit-null rules), and
-    that ``result_kind`` is the kind *scenario* produces. Returns the result_kind."""
+def _validate_result_discriminator(payload: dict[str, Any]) -> str:
+    """Validate the CLOSED discriminator + the CAPTURED plan_policy_id / gate_outcome explicit-null
+    rules. NO scenario↔kind coherence check — every kind is representable under every scenario (the
+    matrix records what the SUT DID, agreement or not). These are PROVENANCE-consistency checks
+    (integrity), not expected-value checks: a captured plan under a non_run, or a gate outcome under
+    an infra row, are malformed records; value mismatches are admissibility's job. Returns the
+    result_kind."""
     kind = _require(payload, "result_kind", types=(str,))
     if kind not in VALID_RESULT_KINDS:
         raise SchemaViolationError(
             f"result_kind: must be one of {sorted(VALID_RESULT_KINDS)}, got {kind!r}")
-    if kind != _SCENARIO_KIND[scenario]:
-        raise SchemaViolationError(
-            f"result_kind {kind!r} is not the kind scenario {scenario!r} produces "
-            f"({_SCENARIO_KIND[scenario]!r}) — incoherent evidence")
     if not _require(payload, "result_reason", types=(str,)):
         raise SchemaViolationError("result_reason: must be a non-empty audit token")
     _require(payload, "result_sub_reason", types=(str,))  # may be empty
-    # gate_outcome — EXPLICIT null for an infra row; a known outcome otherwise.
+    # gate_outcome — EXPLICIT null iff infra (the machinery failed before a verdict); else a known
+    # outcome. A gate outcome under an infra row is a provenance contradiction (integrity fail).
     gate_outcome = payload.get("gate_outcome", "<absent>")
     if kind == "infrastructure_failure":
         if gate_outcome is not None:
             raise SchemaViolationError(
-                "gate_outcome: an infrastructure_failure row carries an explicit null gate outcome")
-    else:
-        if gate_outcome not in VALID_GATE_OUTCOMES:
-            raise SchemaViolationError(
-                f"gate_outcome: must be one of {sorted(VALID_GATE_OUTCOMES)}, got {gate_outcome!r}")
-    # plan_policy_id — CAPTURED: an EXPLICIT null when no plan was dispatched (a non_run); the
-    # captured plan's policy otherwise (never fabricated from the configured policy).
+                "gate_outcome: an infrastructure_failure carries an explicit null (no verdict was "
+                "reliably produced) — a gate outcome here contradicts the provenance")
+    elif gate_outcome not in VALID_GATE_OUTCOMES:
+        raise SchemaViolationError(
+            f"gate_outcome: must be one of {sorted(VALID_GATE_OUTCOMES)}, got {gate_outcome!r}")
+    # plan_policy_id — CAPTURED: an EXPLICIT null iff non_run (the SUT did not execute, so no plan
+    # was captured); the captured plan's policy otherwise (never fabricated from the configured
+    # policy). A captured plan under a non_run is a provenance contradiction (integrity fail).
     plan_policy_id = payload.get("plan_policy_id", "<absent>")
     if kind == "non_run":
         if plan_policy_id is not None:
             raise SchemaViolationError(
-                "plan_policy_id: a non_run dispatched no plan — it must be an explicit null, not a "
-                "fabricated policy id")
-    else:
-        if not isinstance(plan_policy_id, str) or not plan_policy_id:
-            raise SchemaViolationError(
-                "plan_policy_id: a plan was captured — it must be a non-empty policy id")
+                "plan_policy_id: a non_run did not execute — it must be an explicit null, not a "
+                "captured/fabricated policy id")
+    elif not isinstance(plan_policy_id, str) or not plan_policy_id:
+        raise SchemaViolationError(
+            "plan_policy_id: a plan was captured — it must be a non-empty policy id")
     return str(kind)
 
 
+def _validate_seed_trace(payload: dict[str, Any]) -> None:
+    """The signed SeedProvenance sub-object: every field non-empty; seed_image_digest is the
+    canonical ``sha256:<hex64>`` calibration image (the SEED endpoint of a drift, M3/QM-3)."""
+    seed = _require_nested(payload, "seed_trace", _SEED_TRACE_KEYS, "seed_trace")
+    _require_nonempty_str_fields(seed, _SEED_TRACE_KEYS, "seed_trace")
+    if not _SHA256_PREFIXED_RE.match(seed["seed_image_digest"]):
+        raise SchemaViolationError(
+            "seed_trace.seed_image_digest: must be 'sha256:<64 hex>', got "
+            f"{seed['seed_image_digest']!r}")
+
+
+def _validate_aba_fault_injection(payload: dict[str, Any]) -> None:
+    """The ABA fault_injection sub-object: the disclosure triple (locus/mechanism/interleave)
+    + the FIVE heads as hex64 digests, and (M4) the ABA SHAPE asserted STRUCTURALLY (not against any
+    expected value): head_bound == head_returned (the set-head returned to an identical value),
+    head_moved != head_bound (real movement between), policy_head_pre != policy_head_post (policy
+    generation actually moved). Non-degenerate — "x" five times cannot pass."""
+    fi = _require_nested(payload, "fault_injection", _FAULT_INJECTION_ABA_KEYS, "fault_injection")
+    _require_nonempty_str_fields(fi, _FAULT_INJECTION_BASE_KEYS, "fault_injection")
+    for _h in ("head_bound", "head_moved", "head_returned", "policy_head_pre", "policy_head_post"):
+        _require_hex64(fi, _h)
+    if fi["head_bound"] != fi["head_returned"]:
+        raise SchemaViolationError(
+            "fault_injection: ABA requires head_bound == head_returned (returned identical)")
+    if fi["head_moved"] == fi["head_bound"]:
+        raise SchemaViolationError(
+            "fault_injection: ABA requires head_moved != head_bound (real movement between)")
+    if fi["policy_head_pre"] == fi["policy_head_post"]:
+        raise SchemaViolationError(
+            "fault_injection: ABA requires policy_head_pre != policy_head_post (generation moved)")
+
+
 def validate_execution_payload_v3(payload: dict[str, Any]) -> None:
-    """Validate an execution receipt payload (schema v3 — LIVE ENFORCEMENT). Provenance-typed and
-    SCENARIO-SPECIFIC: the exact key set is the common set + the scenario's observed set, and a
-    receipt may sign ONLY what its scenario produced. Fail-closed on a missing/extra field, an
-    incoherent scenario↔kind, or a fabricated (rather than explicitly-null) capture."""
+    """Validate an execution receipt payload (schema v3 — LIVE ENFORCEMENT). Provenance-typed by the
+    (scenario, observed_kind) MATRIX: the exact key set is the common set + the scenario's
+    configured/fault fields + the OBSERVED kind's result fields. EVERY closed kind is representable
+    under EVERY scenario, so a refutation (e.g. an ABA that unexpectedly admits) is a well-formed
+    record — integrity checks provenance consistency, admissibility checks value-vs-prediction. Fail
+    closed on a missing/extra field or a provenance contradiction."""
     scenario = _require(payload, "scenario", types=(str,))
     if scenario not in VALID_SCENARIOS:
         raise SchemaViolationError(
             f"scenario: must be one of {sorted(VALID_SCENARIOS)}, got {scenario!r}")
-    _check_unknown_keys(payload, execution_keys_for_scenario(scenario), "execution")
+    result_kind = _require(payload, "result_kind", types=(str,))
+    if result_kind not in VALID_RESULT_KINDS:
+        raise SchemaViolationError(
+            f"result_kind: must be one of {sorted(VALID_RESULT_KINDS)}, got {result_kind!r}")
+    _check_unknown_keys(payload, execution_keys_for(scenario, result_kind), "execution")
     _validate_schema_version(payload, 3)
     _validate_execution_common(payload)  # profile/gated_commit/outcome/executed_at/digest/prereg
     if not _require(payload, "configured_policy_id", types=(str,)):
         raise SchemaViolationError("configured_policy_id: must be non-empty")
     _require_hex64(payload, "event_digest")
-    kind = _validate_result_discriminator(payload, scenario)
-    # SEED_TRACE — always present (every enforcement scenario reached ENABLED via a real seed).
-    seed = _require_nested(payload, "seed_trace", _SEED_TRACE_KEYS, "seed_trace")
-    _require_nonempty_str_fields(seed, _SEED_TRACE_KEYS, "seed_trace")
+    kind = _validate_result_discriminator(payload)
+    _validate_seed_trace(payload)
 
-    # scenario-specific OBSERVED fields.
-    if scenario == ScenarioId.COMPLIANT_ADMIT.value:
-        # the measured coordinates the ADMITTED run produced (from the authoritative return).
+    # CONFIGURED / FAULT-INJECTION fields, keyed by SCENARIO (what the harness did).
+    if scenario == ScenarioId.ABA_GENERATION_MOVED.value:
+        _validate_aba_fault_injection(payload)
+    elif scenario == ScenarioId.SHA_TAMPER.value:
+        fi = _require_nested(
+            payload, "fault_injection", _FAULT_INJECTION_BASE_KEYS, "fault_injection")
+        _require_nonempty_str_fields(fi, _FAULT_INJECTION_BASE_KEYS, "fault_injection")
+    elif scenario == ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE.value:
+        # the CONFIGURED second (drift) image identity — bound to prereg.rc_image_digest in
+        # continuity; the refusal proves measured subject drift, not the exact executed image.
+        _require_sha256_prefixed(payload, "drift_image_digest")
+
+    # OBSERVED-RESULT fields, keyed by the OBSERVED result_kind (what the SUT produced). Only an
+    # admitted run measured coordinates — present whatever the scenario predicted (refutations bind
+    # them too).
+    if kind == "admitted_run":
         for _field in (
             "bound_oracle_head", "observed_policy_head_post_admission",
             "resolved_profile_digest", "trust_policy_digest", "guard_policy_digest",
@@ -563,19 +638,6 @@ def validate_execution_payload_v3(payload: dict[str, Any]) -> None:
             _require_hex64(payload, _field)
         _require_sha256_prefixed(payload, "artifact_tree_hash")
         _require_sha256_prefixed(payload, "image_digest")
-    elif scenario == ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE.value:
-        # amendment 4: sign the CONFIGURED second-image identity + the refusal reason — NO measured
-        # coordinates (the drifted report sink is non-authoritative; deferred to a gated follow-up).
-        _require_sha256_prefixed(payload, "drift_image_digest")
-    elif scenario == ScenarioId.ABA_GENERATION_MOVED.value:
-        fi = _require_nested(
-            payload, "fault_injection", _FAULT_INJECTION_ABA_KEYS, "fault_injection")
-        _require_nonempty_str_fields(fi, _FAULT_INJECTION_ABA_KEYS, "fault_injection")
-    elif scenario == ScenarioId.SHA_TAMPER.value:
-        fi = _require_nested(
-            payload, "fault_injection", _FAULT_INJECTION_BASE_KEYS, "fault_injection")
-        _require_nonempty_str_fields(fi, _FAULT_INJECTION_BASE_KEYS, "fault_injection")
-    # NON_ENABLED_DEGRADED carries no scenario-specific observed field (no plan, no measurement).
 
     # outcome coherence: only an admitted run carries a pass|fail verdict; every other kind errored.
     if kind == "admitted_run":

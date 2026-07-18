@@ -304,18 +304,52 @@ def validate_semantic_continuity(
         raise SemanticContinuityError(
             f"gated_commit mismatch: prereg={prereg_commit!r} execution={exec_commit!r}"
         )
-    # v3 enforcement continuity: the CONFIGURED policy and the SCENARIO are bound to the
-    # preregistration — a run cannot post-hoc choose which policy/scenario its signed evidence
-    # attests to. (The captured plan_policy_id is CAPTURED provenance, checked in the schema, not a
-    # continuity operand — a non_run legitimately has none.)
+    # v3 enforcement continuity (M3): bind the execution to its preregistered context so a validly
+    # signed execution cannot be REBOUND to a different prereg. Every authority field × every path.
     if execution.payload.get("schema_version") == 3:
+        ep, xp = prereg.payload, execution.payload
+        cfg = ep.get("configured_policy_id")
+        # the configured policy + the scenario are the preregistered ones.
         for _field in ("configured_policy_id", "scenario"):
-            pv = prereg.payload.get(_field)
-            ev = execution.payload.get(_field)
-            if pv != ev:
+            if ep.get(_field) != xp.get(_field):
                 raise SemanticContinuityError(
-                    f"{_field} mismatch: prereg={pv!r} != execution={ev!r} — the run's "
-                    f"{_field} was not preregistered")
+                    f"{_field} mismatch: prereg={ep.get(_field)!r} != execution={xp.get(_field)!r} "
+                    f"— the run's {_field} was not preregistered")
+        # the event the run processed is the preregistered event.
+        if xp.get("event_digest") != ep.get("rc_event_digest"):
+            raise SemanticContinuityError(
+                f"event_digest {xp.get('event_digest')!r} != prereg.rc_event_digest "
+                f"{ep.get('rc_event_digest')!r} — the run was rebound to a different event")
+        # a captured plan (present unless non_run) is for the configured policy.
+        ppid = xp.get("plan_policy_id")
+        if ppid is not None and ppid != cfg:
+            raise SemanticContinuityError(
+                f"plan_policy_id {ppid!r} != configured_policy_id {cfg!r} — plan "
+                "mis-bound")
+        # the seed trace is for the configured policy + the preregistered detector.
+        seed = xp.get("seed_trace") or {}
+        if seed.get("policy_id") != cfg:
+            raise SemanticContinuityError(
+                f"seed_trace.policy_id {seed.get('policy_id')!r} != configured_policy_id {cfg!r}")
+        if seed.get("detector_id") != ep.get("rc_detector_id"):
+            raise SemanticContinuityError(
+                f"seed_trace.detector_id {seed.get('detector_id')!r} != prereg.rc_detector_id "
+                f"{ep.get('rc_detector_id')!r}")
+        # image continuity: the run image is the preregistered one; for subject_drift the SEED image
+        # is a DISTINCT configured enforcement image (both drift endpoints bound — QM-3).
+        rc_img = ep.get("rc_image_digest")
+        if "image_digest" in xp and xp.get("image_digest") != rc_img:
+            raise SemanticContinuityError(
+                f"image_digest {xp.get('image_digest')!r} != prereg.rc_image_digest {rc_img!r}")
+        if "drift_image_digest" in xp:
+            if xp.get("drift_image_digest") != rc_img:
+                raise SemanticContinuityError(
+                    "drift_image_digest != prereg.rc_image_digest "
+                    f"{rc_img!r} — the configured run image was not preregistered")
+            if seed.get("seed_image_digest") == rc_img:
+                raise SemanticContinuityError(
+                    "subject_drift requires seed_image_digest != rc_image_digest (a distinct "
+                    "configured enforcement image); the refusal proves measured subject drift")
 
 
 # ------------------------------------------------------------------
