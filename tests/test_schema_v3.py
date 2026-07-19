@@ -126,8 +126,14 @@ def _prereg(scenario: ScenarioId) -> dict[str, Any]:
 
 
 def _exec(scenario: ScenarioId, observed_kind: str, *, result_reason: str, outcome: str,
-          gate_outcome: Any = "<auto>", plan: Any = "<auto>") -> dict[str, Any]:
-    """An execution payload for ANY (scenario, observed_kind) cell — matched or refuting."""
+          result_sub_reason: str = "", gate_outcome: Any = "<auto>",
+          plan: Any = "<auto>") -> dict[str, Any]:
+    """An execution payload for ANY (scenario, observed_kind) cell — matched or refuting.
+
+    ``result_sub_reason`` is the OBSERVED forensic sub-token (default ""): load-bearing for the
+    2.2a currency refusals whose admissibility forks on it (store_unreachable vs the None-return
+    'unresolved'; attestation_absent). A matched cell must carry the AUTHORED sub_reason or the
+    observed triple will not equal the preregistered expected triple (fail-closed non-admission)."""
     if gate_outcome == "<auto>":
         gate_outcome = _gate_outcome_for(observed_kind)
     if plan == "<auto>":
@@ -137,7 +143,8 @@ def _exec(scenario: ScenarioId, observed_kind: str, *, result_reason: str, outco
         "executed_at": _ISO, "canonical_digest_alg": "sha256", "canonical_digest_version": 1,
         "prereg_digest": _HEX,  # placeholder; build_execution_receipt overwrites it
         "scenario": scenario.value, "configured_policy_id": _POLICY, "event_digest": _HEX,
-        "result_kind": observed_kind, "result_reason": result_reason, "result_sub_reason": "",
+        "result_kind": observed_kind, "result_reason": result_reason,
+        "result_sub_reason": result_sub_reason,
         "gate_outcome": gate_outcome, "plan_policy_id": plan, "seed_trace": _seed_trace(scenario),
     }
     # CONFIGURED / FAULT-INJECTION by scenario (what the harness did).
@@ -154,11 +161,15 @@ def _exec(scenario: ScenarioId, observed_kind: str, *, result_reason: str, outco
 
 
 def _matched_exec(scenario: ScenarioId) -> dict[str, Any]:
-    """The happy/matched execution for *scenario* (observed == expected)."""
-    kind = _EXPECTED_KIND[scenario]
-    if kind == "admitted_run":
-        return _exec(scenario, kind, result_reason="all_retried", outcome="pass")
-    return _exec(scenario, kind, result_reason=expected_for(scenario).reason, outcome="error")
+    """The happy/matched execution for *scenario* (observed == expected) — built from the AUTHORED
+    triple (kind + reason + sub_reason) so the observed triple equals the preregistered prediction
+    exactly, including the load-bearing 2.2a sub_reasons. No hand-duplicated expectation."""
+    exp = expected_for(scenario)
+    if exp.kind == "admitted_run":  # an admitted run's observed reason is its OUTCOME (Q2), not exp
+        return _exec(scenario, exp.kind, result_reason="all_retried",
+                     result_sub_reason=exp.sub_reason, outcome="pass")
+    return _exec(scenario, exp.kind, result_reason=exp.reason,
+                 result_sub_reason=exp.sub_reason, outcome="error")
 
 
 def _chain(prereg_payload: dict[str, Any], exec_payload: dict[str, Any],
@@ -382,10 +393,31 @@ class RefutationRoundTripTests(unittest.TestCase):
 
 class AdmissibilityTests(unittest.TestCase):
     def test_matched_predictions_are_admissible(self) -> None:
+        # Every NON-infra scenario, incl. the three 2.2a currency refusals — the FAST tier must
+        # independently prove the load-bearing sub_reasons (store_unreachable / attestation_absent)
+        # admit only when the observed triple matches the signed prereg (previously podman-only).
         for scenario in (ScenarioId.COMPLIANT_ADMIT, ScenarioId.NON_ENABLED_DEGRADED,
-                         ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE):
+                         ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE,
+                         ScenarioId.SET_HEAD_STALE, ScenarioId.ORACLE_UNAVAILABLE,
+                         ScenarioId.LIVE_ATTESTATION_UNAVAILABLE):
             with self.subTest(scenario=scenario):
                 self.assertTrue(_chain(_prereg(scenario), _matched_exec(scenario)).is_admitted)
+
+    def test_currency_sub_reason_is_load_bearing_for_admission(self) -> None:
+        # The CONVERSE of the matched-admits proof: an execution matching the currency refusal in
+        # kind AND reason but carrying the WRONG (empty) sub_reason must NOT admit — proving the
+        # sub_reason fork (store_unreachable / attestation_absent) is COMPARED, not decorative. This
+        # is what makes admitting the matched cell meaningful (fast tier, no podman).
+        for scenario in (ScenarioId.ORACLE_UNAVAILABLE, ScenarioId.LIVE_ATTESTATION_UNAVAILABLE):
+            with self.subTest(scenario=scenario):
+                self.assertTrue(
+                    expected_for(scenario).sub_reason, "scenario must fork on sub_reason")
+                wrong = _exec(scenario, "blocking_refusal",
+                              result_reason=expected_for(scenario).reason,
+                              result_sub_reason="", outcome="error")  # empty != authored sub_reason
+                self.assertFalse(
+                    _chain(_prereg(scenario), wrong).is_admitted,
+                    "an empty sub_reason must refuse a currency refusal whose prereg forks on it")
 
     def test_matched_infra_is_never_admissible(self) -> None:
         chain = _chain(_prereg(ScenarioId.SHA_TAMPER), _matched_exec(ScenarioId.SHA_TAMPER))

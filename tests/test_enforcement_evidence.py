@@ -35,6 +35,7 @@ from gate.policy_store import PolicyStore
 from nacl.signing import SigningKey
 
 from orchestrator.enforcement_driver import (
+    EnforcementEvidenceError,
     EnforcementRunConfig,
     GatedEnforcementAdapter,
     seed_enabled_policy,
@@ -459,6 +460,24 @@ def _fresh_bad(fixture_id: str) -> Fixture:
         evasion_class="exception-swallowing")
 
 
+def _run_unarmed_compliant(
+    tmp: Path, ps: PolicyStore, cs: Any, prov: Any) -> tuple[Any, Any]:
+    """A FULL COMPLIANT_ADMIT run over the passed stores — used as each 2.2a scheduler's NEGATIVE
+    CONTROL with the scheduler's WRAPPED store passed in but NEVER armed (no arming artifact_source,
+    no fault_scheduler). The wrapped accessor is exercised at BOTH the plan-mint read AND the live
+    admit read across the WHOLE enforce pipeline; disarmed it passes through, so the run ADMITS.
+    This is the 'wrapper is transparent when not armed, end-to-end' half — proving the armed test's
+    refusal is caused by the INJECTION, not the wrapper's mere presence (esp. Class-B: normal
+    availability admits)."""
+    sk = SigningKey.generate()
+    config = EnforcementRunConfig(
+        scenario=ScenarioId.COMPLIANT_ADMIT, policy_store=ps, calibration_store=cs, seed=prov,
+        image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs",
+        signing_key=sk, verify_key=sk.verify_key, registry=Registry(tmp / "registry.db"),
+        head_sha="a" * 40, trials=1, budget=ResourceBudget(wall_clock_seconds=120.0))
+    return GatedEnforcementAdapter().enforce(config)
+
+
 @unittest.skipUnless(
     _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
 )
@@ -498,6 +517,22 @@ class SetHeadStaleScenarioEvidenceTests(unittest.TestCase):
         disc = sched.require_completed_disclosure()  # INTERLEAVE PROOF: fired at the oracle read
         self.assertIn("oracle_head_for", disc["locus"])
         self.assertEqual(ep["fault_injection"], disc)
+
+    def test_unarmed_wrapped_store_admits_full_run(self) -> None:
+        # NEGATIVE CONTROL (full unarmed run): the SAME wrapped calibration store, never armed →
+        # transparent through the whole pipeline → the run ADMITS. The armed test's set_head_stale
+        # refusal is thus caused by the injected append, not the wrapper.
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-stale-neg-"))
+        ps, cs, prov = _seed(tmp)
+        sched = SetHeadStaleScheduler(
+            real_cs=cs, policy_id="uat-enforce", set_id=prov.set_id,
+            artifact_dir=_CORPUS / "retry-good-v1", fresh_fixture=_fresh_bad("stale-neg"))
+        outcome, chain = _run_unarmed_compliant(tmp, ps, sched.calibration_store, prov)
+        self.assertEqual(outcome.result_kind, "admitted_run")
+        self.assertEqual(outcome.outcome, "pass")
+        self.assertTrue(chain.is_admitted)
+        with self.assertRaises(EnforcementEvidenceError):  # never fired → never COMPLETED
+            sched.require_completed_disclosure()
 
 
 @unittest.skipUnless(
@@ -539,6 +574,23 @@ class OracleUnavailableScenarioEvidenceTests(unittest.TestCase):
         self.assertIn("oracle_head_for", disc["locus"])
         self.assertEqual(ep["fault_injection"], disc)
 
+    def test_unarmed_wrapped_store_admits_full_run(self) -> None:
+        # NEGATIVE CONTROL (full unarmed run) — the mandatory Class-B honesty condition: when the
+        # oracle store is AVAILABLE (the wrapper never raises because it is never armed), the SAME
+        # setup ADMITS end-to-end. Proves oracle_unavailable/store_unreachable is the injected
+        # RAISE, not an artifact of routing set_head through the wrapper.
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-oracle-neg-"))
+        ps, cs, prov = _seed(tmp)
+        sched = OracleUnavailableScheduler(
+            real_cs=cs, policy_id="uat-enforce", set_id=prov.set_id,
+            artifact_dir=_CORPUS / "retry-good-v1")
+        outcome, chain = _run_unarmed_compliant(tmp, ps, sched.calibration_store, prov)
+        self.assertEqual(outcome.result_kind, "admitted_run")
+        self.assertEqual(outcome.outcome, "pass")
+        self.assertTrue(chain.is_admitted)
+        with self.assertRaises(EnforcementEvidenceError):  # never raised → never COMPLETED
+            sched.require_completed_disclosure()
+
 
 @unittest.skipUnless(
     _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
@@ -579,6 +631,23 @@ class LiveAttestationUnavailableScenarioEvidenceTests(unittest.TestCase):
         disc = sched.require_completed_disclosure()
         self.assertIn("current_attestation", disc["locus"])
         self.assertEqual(ep["fault_injection"], disc)
+
+    def test_unarmed_wrapped_store_admits_full_run(self) -> None:
+        # NEGATIVE CONTROL (full unarmed run): the SAME wrapped policy store, never armed → the
+        # attestation read passes through the live ENABLED snapshot → the run ADMITS. The armed
+        # test's live_attestation_unavailable/attestation_absent refusal is thus caused by the
+        # injected ENABLED→DEGRADED transition, not by wrapping current_attestation_snapshot.
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-liveattn-neg-"))
+        ps, cs, prov = _seed(tmp)
+        sched = LiveAttestationUnavailableScheduler(
+            real_ps=ps, policy_id="uat-enforce", set_id=prov.set_id,
+            artifact_dir=_CORPUS / "retry-good-v1")
+        outcome, chain = _run_unarmed_compliant(tmp, sched.policy_store, cs, prov)
+        self.assertEqual(outcome.result_kind, "admitted_run")
+        self.assertEqual(outcome.outcome, "pass")
+        self.assertTrue(chain.is_admitted)
+        with self.assertRaises(EnforcementEvidenceError):  # never transitioned → never COMPLETED
+            sched.require_completed_disclosure()
 
 
 class WiringPinTests(unittest.TestCase):
