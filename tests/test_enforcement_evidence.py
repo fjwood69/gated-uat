@@ -53,6 +53,11 @@ from ._currency_schedulers import (
     OracleUnavailableScheduler,
     SetHeadStaleScheduler,
 )
+from ._recal_schedulers import (
+    SetMovedRecalScheduler,
+    SubjectMovedRecalScheduler,
+    uat_set2_fixtures,
+)
 from ._tamper_scheduler import TamperInjectionScheduler
 
 _IMAGE_REF = "localhost/mori:local"
@@ -648,6 +653,170 @@ class LiveAttestationUnavailableScenarioEvidenceTests(unittest.TestCase):
         self.assertTrue(chain.is_admitted)
         with self.assertRaises(EnforcementEvidenceError):  # never transitioned → never COMPLETED
             sched.require_completed_disclosure()
+
+
+def _run_compliant_with_source(
+    tmp: Path, ps: PolicyStore, cs: Any, prov: Any, source: Any) -> tuple[Any, Any]:
+    """A full COMPLIANT_ADMIT run using a CUSTOM artifact_source — the 2.2b negative-control body:
+    the recal scheduler's OWN artifact_source, constructed UNARMED, so it stages the compliant tree
+    and SKIPS the loop → admit reads the original ENABLED binding → admits. Proves the armed test's
+    refusal is caused by the recalibration LOOP, not by the scheduler's staging/wiring."""
+    sk = SigningKey.generate()
+    config = EnforcementRunConfig(
+        scenario=ScenarioId.COMPLIANT_ADMIT, policy_store=ps, calibration_store=cs, seed=prov,
+        image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs",
+        signing_key=sk, verify_key=sk.verify_key, registry=Registry(tmp / "registry.db"),
+        head_sha="a" * 40, trials=1, budget=ResourceBudget(wall_clock_seconds=120.0),
+        artifact_source=source)
+    return GatedEnforcementAdapter().enforce(config)
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class AuthorizedSetMovedScenarioEvidenceTests(unittest.TestCase):
+    """AUTHORIZED_SET_MOVED (slice 2.2b, Class A / public governance): between plan-mint and admit,
+    a REAL public recalibration loop (ENABLED→ADVISORY→PENDING_CALIBRATION→CALIBRATING→ENABLED)
+    repoints the policy onto a DISTINCT second set → admit reads live_set_id != plan.authorized_set
+    → refuses at check #3 (blocking_refusal, run_verdict — a completed run rejected at admission);
+    its signed refutation is admissible on the harness's own path."""
+
+    def test_set_moved_yields_signed_admissible_refusal(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-setmoved-"))
+        ps, cs, prov = _seed(tmp)
+        signing_key = SigningKey.generate()
+        good2, bad2 = uat_set2_fixtures(_CORPUS)
+        sched = SetMovedRecalScheduler(
+            policy_store=ps, calibration_store=cs, seed=prov, target_set_id="uat-set2",
+            recal_image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1",
+            budget=ResourceBudget(wall_clock_seconds=120.0), new_set_fixtures=(good2, bad2))
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.AUTHORIZED_SET_MOVED, policy_store=ps, calibration_store=cs,
+            seed=prov, image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1",
+            runs_dir=tmp / "runs", signing_key=signing_key, verify_key=signing_key.verify_key,
+            registry=Registry(tmp / "registry.db"), head_sha="a" * 40, trials=1,
+            budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=sched.artifact_source, fault_scheduler=sched)
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        self.assertEqual(outcome.result_kind, "blocking_refusal")
+        self.assertEqual(outcome.reason, "authorized_set_moved")
+        self.assertEqual(outcome.sub_reason, "")
+        self.assertTrue(chain.is_admitted)
+        ep = chain.execution.payload
+        self.assertEqual(ep["gate_outcome"], "run_verdict")  # a completed run refused at admission
+        self.assertEqual(ep["plan_policy_id"], "uat-enforce")  # plan minted pre-loop (old binding)
+        disc = sched.require_completed_disclosure()
+        self.assertIn("current_attestation", disc["locus"])
+        self.assertEqual(ep["fault_injection"], disc)
+
+    def test_unarmed_recal_admits_full_run(self) -> None:
+        # NEGATIVE CONTROL (full unarmed run): the SAME scheduler machinery, armed=False → the loop
+        # is SKIPPED → the run admits the compliant tree against the original set. The refusal is
+        # thus caused by the recalibration loop, not by staging.
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-setmoved-neg-"))
+        ps, cs, prov = _seed(tmp)
+        good2, bad2 = uat_set2_fixtures(_CORPUS)
+        sched = SetMovedRecalScheduler(
+            policy_store=ps, calibration_store=cs, seed=prov, target_set_id="uat-set2",
+            recal_image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1",
+            budget=ResourceBudget(wall_clock_seconds=120.0), new_set_fixtures=(good2, bad2),
+            armed=False)
+        outcome, chain = _run_compliant_with_source(tmp, ps, cs, prov, sched.artifact_source)
+        self.assertEqual(outcome.result_kind, "admitted_run")
+        self.assertEqual(outcome.outcome, "pass")
+        self.assertTrue(chain.is_admitted)
+        with self.assertRaises(EnforcementEvidenceError):  # loop never ran → never COMPLETED
+            sched.require_completed_disclosure()
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF) and _podman_image_available(_IMAGE_REF_2),
+    f"{_IMAGE_REF} + {_IMAGE_REF_2} both required in the Podman image store",
+)
+class AuthorizedSubjectMovedScenarioEvidenceTests(unittest.TestCase):
+    """AUTHORIZED_SUBJECT_MOVED (slice 2.2b, Class A / public governance): between plan-mint and
+    admit, a REAL public recalibration loop on the SAME set but a SECOND IMAGE moves the
+    live-authorized subject (the execution-identity coordinate) while set_id + set_head stay put →
+    admit reads set+head match but plan.target_subject != live_subject → refuses at #5 only."""
+
+    def test_subject_moved_yields_signed_admissible_refusal(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-subjmoved-"))
+        ps, cs, prov = _seed(tmp, image_ref=_IMAGE_REF)  # seeded (subject) on image 1
+        signing_key = SigningKey.generate()
+        sched = SubjectMovedRecalScheduler(
+            policy_store=ps, calibration_store=cs, seed=prov, target_set_id=prov.set_id,
+            recal_image_ref=_IMAGE_REF_2,  # recalibrate the SAME set on image 2 → subject moves
+            artifact_dir=_CORPUS / "retry-good-v1", budget=ResourceBudget(wall_clock_seconds=120.0))
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.AUTHORIZED_SUBJECT_MOVED, policy_store=ps, calibration_store=cs,
+            seed=prov, image_ref=_IMAGE_REF, artifact_dir=_CORPUS / "retry-good-v1",
+            runs_dir=tmp / "runs", signing_key=signing_key, verify_key=signing_key.verify_key,
+            registry=Registry(tmp / "registry.db"), head_sha="a" * 40, trials=1,
+            budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=sched.artifact_source, fault_scheduler=sched)
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        self.assertEqual(outcome.result_kind, "blocking_refusal")
+        self.assertEqual(outcome.reason, "authorized_subject_moved")
+        self.assertEqual(outcome.sub_reason, "")
+        self.assertTrue(chain.is_admitted)
+        ep = chain.execution.payload
+        self.assertEqual(ep["gate_outcome"], "run_verdict")
+        self.assertEqual(ep["plan_policy_id"], "uat-enforce")
+        disc = sched.require_completed_disclosure()
+        self.assertIn("current_attestation", disc["locus"])
+        self.assertEqual(ep["fault_injection"], disc)
+
+    def test_unarmed_recal_admits_full_run(self) -> None:
+        # NEGATIVE CONTROL (full unarmed run): same machinery, armed=False → loop skipped → admits.
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-subjmoved-neg-"))
+        ps, cs, prov = _seed(tmp, image_ref=_IMAGE_REF)
+        sched = SubjectMovedRecalScheduler(
+            policy_store=ps, calibration_store=cs, seed=prov, target_set_id=prov.set_id,
+            recal_image_ref=_IMAGE_REF_2, artifact_dir=_CORPUS / "retry-good-v1",
+            budget=ResourceBudget(wall_clock_seconds=120.0), armed=False)
+        outcome, chain = _run_compliant_with_source(tmp, ps, cs, prov, sched.artifact_source)
+        self.assertEqual(outcome.result_kind, "admitted_run")
+        self.assertEqual(outcome.outcome, "pass")
+        self.assertTrue(chain.is_admitted)
+        with self.assertRaises(EnforcementEvidenceError):
+            sched.require_completed_disclosure()
+
+
+class RefusalCompletenessTests(unittest.TestCase):
+    """slice 2.2b (always-run, no podman): the harness's coverage of gated's admission-refusal
+    taxonomy is COMPLETE and gap-free — EVERY ``RunAdmissionRefusal`` member is either COVERED by an
+    authored ScenarioId's expected reason OR explicitly classified NON_INDUCIBLE (a proven
+    non-inducibility with a stated FABRICATION reason). A new gated refusal reason that is neither
+    fails this test — an uncovered refusal cannot masquerade as 'handled' (analogue of
+    ``assert_inducible``)."""
+
+    def test_every_refusal_is_covered_or_non_inducible(self) -> None:
+        from gate.run_admission import RunAdmissionRefusal
+
+        from orchestrator.expectations import NON_INDUCIBLE, covered_refusal_reasons
+
+        covered = covered_refusal_reasons()
+        for member in RunAdmissionRefusal:
+            with self.subTest(refusal=member.value):
+                self.assertTrue(
+                    member.value in covered or member.value in NON_INDUCIBLE,
+                    f"gated refusal {member.value!r} is neither covered by a ScenarioId nor "
+                    "classified NON_INDUCIBLE — must be one or the other (no silent gap)")
+
+    def test_non_inducible_reasons_are_genuinely_uncovered(self) -> None:
+        # the three STRUCTURAL non-inducibles must NOT also be covered by a scenario — else the
+        # NON_INDUCIBLE claim is dead weight hiding an actually-tested refusal.
+        from orchestrator.expectations import NON_INDUCIBLE, covered_refusal_reasons
+
+        covered = covered_refusal_reasons()
+        for reason in ("icv_unsupported", "unauthorized_subject", "incomplete_coordinates"):
+            self.assertIn(reason, NON_INDUCIBLE)
+            self.assertNotIn(
+                reason, covered, f"{reason} is classified NON_INDUCIBLE yet also covered")
 
 
 class WiringPinTests(unittest.TestCase):
