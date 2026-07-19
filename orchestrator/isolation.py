@@ -20,6 +20,7 @@ from __future__ import annotations
 import platform
 import re
 import sqlite3
+import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -43,6 +44,11 @@ class RunState(str, Enum):
 _TERMINAL_STATES: frozenset[RunState] = frozenset(
     {RunState.COMPLETED, RunState.REAPED, RunState.FAILED}
 )
+
+# _init_schema retry budget: two processes racing to set journal_mode=WAL on a fresh registry can
+# see a non-busy-handled "database is locked". Idempotent init -> bounded retry + linear backoff.
+_INIT_SCHEMA_RETRIES = 8
+_INIT_SCHEMA_BACKOFF_S = 0.05
 
 
 class AllocationError(RuntimeError):
@@ -177,21 +183,37 @@ class Registry:
         return conn
 
     def _init_schema(self) -> None:
-        # Use a separate connection with a long timeout and default isolation_level
-        # so that PRAGMA journal_mode=WAL waits correctly if two processes race here.
-        conn = sqlite3.connect(str(self._path), timeout=30.0)
-        try:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS run_registry (
-                    run_id        TEXT PRIMARY KEY,
-                    created_at    TEXT NOT NULL,
-                    state         TEXT NOT NULL DEFAULT 'active',
-                    control_host  TEXT NOT NULL
+        # Two control PROCESSES can construct a Registry on the same path CONCURRENTLY (the §9.7
+        # race). Switching journal_mode=WAL needs a write lock, and — unlike an ordinary statement —
+        # ``PRAGMA journal_mode=WAL`` returns SQLITE_BUSY *immediately* without invoking the busy
+        # handler, so ``busy_timeout`` does NOT cover it: a loser sees "database is locked" on a
+        # contended host (observed on a 2-core CI runner, not the many-core dev host). The init is
+        # IDEMPOTENT (WAL is a no-op once set; CREATE TABLE IF NOT EXISTS), so retry a bounded
+        # number of times with a short backoff, then fail closed — never a half-init registry.
+        last_exc: sqlite3.OperationalError | None = None
+        for attempt in range(_INIT_SCHEMA_RETRIES):
+            conn = sqlite3.connect(str(self._path), timeout=30.0)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS run_registry (
+                        run_id        TEXT PRIMARY KEY,
+                        created_at    TEXT NOT NULL,
+                        state         TEXT NOT NULL DEFAULT 'active',
+                        control_host  TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
+                conn.commit()
+                return
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise  # a real error, not the WAL-set race — do not mask it
+                last_exc = exc
+            finally:
+                conn.close()
+            time.sleep(_INIT_SCHEMA_BACKOFF_S * (attempt + 1))  # linear backoff off the contention
+        raise RuntimeError(
+            "could not initialise the run registry schema after "
+            f"{_INIT_SCHEMA_RETRIES} attempts (persistent 'database is locked')") from last_exc
