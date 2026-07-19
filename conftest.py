@@ -32,7 +32,7 @@ if _GATED_DEV.is_dir():
 
     # Shared enforcement: exact-pin + clean-tree; raises RuntimeError on mismatch.
     # The adapter imports gate/engine modules from the worktree at runtime, so a
-    # dirty or mismatched tree silently executes different bytes than 628e5a3.
+    # dirty or mismatched tree silently executes different bytes than 1d75d54.
     from orchestrator.gated_pin import verify_gated_dependency
 
     verify_gated_dependency(_GATED_DEV)

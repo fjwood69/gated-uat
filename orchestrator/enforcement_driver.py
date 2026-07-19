@@ -256,7 +256,12 @@ def map_job_result(result: Any) -> EnforcementOutcome:
     infrastructure_failure. Only an ``AdmittedRunResult`` yields the measured coordinates; the other
     members carry no measured fields (mirroring the v3 schema's admitted-only rule)."""
     from core import VerdictType
-    from gate.job_result import (
+
+    # AdmittedRunResult / BlockingRefusal are runtime-public but absent from gate.job_result's
+    # __all__, so mypy --strict's no-implicit-reexport flags them WHEN gated is on the path (the
+    # typecheck CI). The unused-ignore code keeps this green in the OTHER mode too (gated absent ->
+    # gate.* is Any via ignore_missing_imports -> no attr-defined error -> ignore would be unused).
+    from gate.job_result import (  # type: ignore[attr-defined,unused-ignore]
         AdmittedRunResult,
         BlockingRefusal,
         GateOutcome,
