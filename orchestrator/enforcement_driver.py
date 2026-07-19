@@ -56,6 +56,9 @@ _FAULT_SCHEDULER_SCENARIOS: frozenset[ScenarioId] = frozenset({
     ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SHA_TAMPER,
     ScenarioId.SET_HEAD_STALE, ScenarioId.ORACLE_UNAVAILABLE,
     ScenarioId.LIVE_ATTESTATION_UNAVAILABLE,
+    # slice 2.2b — the recalibration-loop scenarios also own a COMPLETED-gated induction disclosure
+    # (the real public ENABLED->ADVISORY->PENDING_CALIBRATION->CALIBRATING->ENABLED rebind record).
+    ScenarioId.AUTHORIZED_SET_MOVED, ScenarioId.AUTHORIZED_SUBJECT_MOVED,
 })
 
 

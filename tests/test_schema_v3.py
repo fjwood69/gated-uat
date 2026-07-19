@@ -61,12 +61,16 @@ _EXPECTED_KIND = {
     ScenarioId.SET_HEAD_STALE: "blocking_refusal",
     ScenarioId.ORACLE_UNAVAILABLE: "blocking_refusal",
     ScenarioId.LIVE_ATTESTATION_UNAVAILABLE: "blocking_refusal",
+    # slice 2.2b — live-authorization rebind refusals (all blocking_refusal).
+    ScenarioId.AUTHORIZED_SET_MOVED: "blocking_refusal",
+    ScenarioId.AUTHORIZED_SUBJECT_MOVED: "blocking_refusal",
 }
 
 # scenarios whose fault_injection is the BASE triple (tamper + the three 2.2a currency injections).
 _BASE_TRIPLE_FAULT = frozenset({
     ScenarioId.SHA_TAMPER, ScenarioId.SET_HEAD_STALE,
     ScenarioId.ORACLE_UNAVAILABLE, ScenarioId.LIVE_ATTESTATION_UNAVAILABLE,
+    ScenarioId.AUTHORIZED_SET_MOVED, ScenarioId.AUTHORIZED_SUBJECT_MOVED,
 })
 
 
@@ -399,7 +403,8 @@ class AdmissibilityTests(unittest.TestCase):
         for scenario in (ScenarioId.COMPLIANT_ADMIT, ScenarioId.NON_ENABLED_DEGRADED,
                          ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE,
                          ScenarioId.SET_HEAD_STALE, ScenarioId.ORACLE_UNAVAILABLE,
-                         ScenarioId.LIVE_ATTESTATION_UNAVAILABLE):
+                         ScenarioId.LIVE_ATTESTATION_UNAVAILABLE,
+                         ScenarioId.AUTHORIZED_SET_MOVED, ScenarioId.AUTHORIZED_SUBJECT_MOVED):
             with self.subTest(scenario=scenario):
                 self.assertTrue(_chain(_prereg(scenario), _matched_exec(scenario)).is_admitted)
 

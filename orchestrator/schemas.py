@@ -198,6 +198,9 @@ _SCENARIO_CONFIGURED: dict[str, frozenset[str]] = {
     ScenarioId.SET_HEAD_STALE.value: frozenset({"fault_injection"}),
     ScenarioId.ORACLE_UNAVAILABLE.value: frozenset({"fault_injection"}),
     ScenarioId.LIVE_ATTESTATION_UNAVAILABLE.value: frozenset({"fault_injection"}),
+    # slice 2.2b — the recalibration-loop scenarios disclose the same base-triple induction record.
+    ScenarioId.AUTHORIZED_SET_MOVED.value: frozenset({"fault_injection"}),
+    ScenarioId.AUTHORIZED_SUBJECT_MOVED.value: frozenset({"fault_injection"}),
 }
 
 # slice 2.2a: the scenarios whose fault_injection is the BASE triple (locus/mechanism/interleave) —
@@ -205,6 +208,7 @@ _SCENARIO_CONFIGURED: dict[str, frozenset[str]] = {
 _BASE_TRIPLE_FAULT_SCENARIOS: frozenset[str] = frozenset({
     ScenarioId.SHA_TAMPER.value, ScenarioId.SET_HEAD_STALE.value,
     ScenarioId.ORACLE_UNAVAILABLE.value, ScenarioId.LIVE_ATTESTATION_UNAVAILABLE.value,
+    ScenarioId.AUTHORIZED_SET_MOVED.value, ScenarioId.AUTHORIZED_SUBJECT_MOVED.value,
 })
 
 # The measured coordinates only an ADMITTED run produces (from the authoritative engine return, not

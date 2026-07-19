@@ -43,6 +43,11 @@ class ScenarioId(Enum):
     SET_HEAD_STALE = "set_head_stale"
     ORACLE_UNAVAILABLE = "oracle_unavailable"
     LIVE_ATTESTATION_UNAVAILABLE = "live_attestation_unavailable"
+    # slice 2.2b — the two live-AUTHORIZATION rebind refusals, induced via the REAL PUBLIC operator
+    # recalibration loop (ENABLED->ADVISORY->PENDING_CALIBRATION->CALIBRATING->ENABLED) run between
+    # plan-mint and admit. Both fire in admit_run_result -> blocking_refusal / run_verdict.
+    AUTHORIZED_SET_MOVED = "authorized_set_moved"
+    AUTHORIZED_SUBJECT_MOVED = "authorized_subject_moved"
 
 
 class InjectionClass(Enum):
@@ -120,6 +125,13 @@ EXPECTATIONS: dict[ScenarioId, Expected] = {
     # returns None (policy no longer ENABLED) → admit refuses live_attestation_unavailable/absent.
     ScenarioId.LIVE_ATTESTATION_UNAVAILABLE: Expected(
         _KIND_REFUSAL, "live_attestation_unavailable", "attestation_absent"),
+    # slice 2.2b — a REAL public recalibration onto a DIFFERENT set between mint and admit moves the
+    # live attestation set off the plan's authorized set → admit refuses (check #3, pre set_head).
+    ScenarioId.AUTHORIZED_SET_MOVED: Expected(_KIND_REFUSAL, "authorized_set_moved", ""),
+    # a REAL public recalibration onto the SAME set on a SECOND IMAGE moves the live-authorized
+    # subject (via the execution-identity coordinate) while set + head stay put → admit refuses
+    # (check #5, not preempted by set-moved/set-head-stale). sub_reason is "" (no fork here).
+    ScenarioId.AUTHORIZED_SUBJECT_MOVED: Expected(_KIND_REFUSAL, "authorized_subject_moved", ""),
 }
 
 
@@ -134,6 +146,42 @@ INJECTION_CLASS: dict[ScenarioId, InjectionClass] = {
     ScenarioId.SET_HEAD_STALE: InjectionClass.STORE_MUTATION,
     ScenarioId.LIVE_ATTESTATION_UNAVAILABLE: InjectionClass.STORE_MUTATION,
     ScenarioId.ORACLE_UNAVAILABLE: InjectionClass.FAULT_SIMULATION,
+    # slice 2.2b — the recalibration loop is REAL public governance writing through the real store
+    # APIs (transition + run_calibration + ratify_enable): a store mutation, not a simulated fault.
+    ScenarioId.AUTHORIZED_SET_MOVED: InjectionClass.STORE_MUTATION,
+    ScenarioId.AUTHORIZED_SUBJECT_MOVED: InjectionClass.STORE_MUTATION,
+}
+
+
+# slice 2.2b — the CLOSED set of gated ``RunAdmissionRefusal`` reasons NON-INDUCIBLE through
+# the real public path, each mapped to WHY (a FABRICATION would be required). Hand-authored literal
+# tokens (this module cannot import gated). A completeness test (test-tier, which CAN import gated)
+# asserts EVERY RunAdmissionRefusal member is either a covered ScenarioId's expected reason OR keyed
+# here — so an UNCOVERED refusal is a PROVEN non-inducibility, never a silent gap (the 2.2b analogue
+# of ``assert_inducible``). Membership here is a CLAIM the completeness test forces us to defend.
+NON_INDUCIBLE: dict[str, str] = {
+    # oracle_head_for == CalibrationStore.set_head, whose contract is str-or-raise: it NEVER returns
+    # None (even a fully-deprecated set yields an empty-membership digest). The 'unresolved' (None)
+    # sub_reason branch is thus unreachable by the real store — only a fabricated None hits it.
+    "oracle_unavailable_unresolved":
+        "oracle_head_for (=set_head) is str-or-raise; the None-return 'unresolved' branch is "
+        "unreachable by the real CalibrationStore — only a fabricated None would hit it",
+    # the real gatekeeper mints target_subject == authorized_subject from ONE attestation snapshot;
+    # a mint-incoherent plan cannot arise from the real mint path — only a hand-built plan.
+    "unauthorized_subject":
+        "the real gatekeeper mints target==authorized from one snapshot; a mint-incoherent plan is "
+        "only producible by fabricating an AuthorizedRunPlan",
+    # ratify_enable binds the build's IDENTITY_CONTRACT_VERSION and the plan carries the same
+    # ICV; a single-pinned-build harness cannot mint a plan under a foreign identity contract.
+    "icv_unsupported":
+        "ratify_enable binds the build's IDENTITY_CONTRACT_VERSION and the plan carries the same "
+        "build ICV; a foreign-ICV plan is unmintable in a single-pinned-build harness",
+    # a real degraded podman run yields non-zero exit / no report / malformed output / runner health
+    # error — never a STRUCTURALLY-VALID-but-incomplete report. Forcing this exact refusal
+    # requires injecting a partial report = fabrication (dissent, slice-2.2b consult finding).
+    "incomplete_coordinates":
+        "a real degraded run yields exit-failure / no-report / malformed output, never a "
+        "struct-valid-but-incomplete report; the exact refusal needs a fabricated partial report",
 }
 
 
@@ -164,7 +212,14 @@ def assert_inducible(scenario: ScenarioId) -> None:
             "a fabricated JobResult/plan/report is not a real gate decision")
 
 
+def covered_refusal_reasons() -> frozenset[str]:
+    """The set of ``reason`` tokens any authored expectation predicts — the values a gated refusal
+    is 'covered' by (a completeness test intersects this with the ``RunAdmissionRefusal`` enum)."""
+    return frozenset(e.reason for e in EXPECTATIONS.values())
+
+
 __all__ = [
     "ScenarioId", "Expected", "EXPECTATIONS", "expected_for",
     "InjectionClass", "INJECTION_CLASS", "injection_class_for", "assert_inducible",
+    "NON_INDUCIBLE", "covered_refusal_reasons",
 ]
