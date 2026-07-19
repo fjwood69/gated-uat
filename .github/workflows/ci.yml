@@ -122,37 +122,34 @@ jobs:
   # that self-skip on hosted runners RUN here with REAL podman + the gated worktree, on a
   # TRUSTED SELF-HOSTED runner (the NUC). Restricted to push-to-main — a persistent
   # self-hosted runner must NEVER execute untrusted fork-PR code.
-  #
-  # ENABLE once a self-hosted runner is registered on the NUC with labels
-  # [self-hosted, nuc, podman] and the localhost/mori:local + localhost/mori-uat:local
-  # images present. Committed disabled so the hosted CI can be green before the runner
-  # exists (a job with no matching runner would hang the whole workflow).
-  #
-  # integration-podman:
-  #   name: Integration (real podman, self-hosted NUC)
-  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-  #   runs-on: [self-hosted, nuc, podman]
-  #   timeout-minutes: 40
-  #   steps:
-  #     - name: Checkout gated-uat
-  #       uses: actions/checkout@v5
-  #       with:
-  #         path: gated-uat
-  #         persist-credentials: false
-  #     - name: Checkout gated @ pin
-  #       uses: actions/checkout@v5
-  #       with:
-  #         repository: fjwood69/gated
-  #         ref: ${{ env.GATED_PIN }}
-  #         token: ${{ secrets.GATED_PIN_TOKEN }}
-  #         path: gated-uat-pin
-  #         persist-credentials: false
-  #     - uses: actions/setup-python@v6
-  #       with:
-  #         python-version: "3.13"
-  #     - run: pip install "pynacl==1.5.0" "pytest==9.0.3"
-  #     # podman present -> the enforcement scenarios (ABA / subject-drift / tamper / admit)
-  #     # run for real; the full 175-test suite is the authoritative merge gate.
-  #     - name: pytest (FULL — real-podman enforcement scenarios)
-  #       working-directory: gated-uat
-  #       run: python -m pytest -q -W error::RuntimeWarning
+  # ENABLED: served by the self-hosted runner `nuc-gated-uat` on the NUC (labels
+  # [self-hosted, nuc, podman]) with localhost/mori:local + localhost/mori-uat:local present. A
+  # non-main event skips this job (the `if` is false) so it never queues for a fork PR.
+  integration-podman:
+    name: Integration (real podman, self-hosted NUC)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, nuc, podman]
+    timeout-minutes: 40
+    steps:
+      - name: Checkout gated-uat
+        uses: actions/checkout@v5
+        with:
+          path: gated-uat
+          persist-credentials: false
+      - name: Checkout gated @ pin
+        uses: actions/checkout@v5
+        with:
+          repository: fjwood69/gated
+          ref: ${{ env.GATED_PIN }}
+          token: ${{ secrets.GATED_PIN_TOKEN }}
+          path: gated-uat-pin
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - run: pip install "pynacl==1.5.0" "pytest==9.0.3"
+      # podman present -> the enforcement scenarios (ABA / subject-drift / tamper / degraded /
+      # admit) run for REAL; the full suite here is the authoritative merge gate.
+      - name: pytest (FULL — real-podman enforcement scenarios)
+        working-directory: gated-uat
+        run: python -m pytest -q -W error::RuntimeWarning
