@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Sized for gated-uat — an EXTERNAL signed-evidence UAT harness for the PRIVATE `gated`
+# engine. gated-uat's own orchestrator imports gated's core.chain (canonical_digest —
+# REUSED, never reimplemented), so the harness modules need gated PRESENT even to import.
+# `typecheck` and `test` therefore check gated out at the PINNED commit (== conftest's
+# ../gated-uat-pin) via a read-only token, so the falsifiability-CORE logic is checked +
+# run on hosted runners; the podman-gated OCI integration tests self-skip here (no podman)
+# and RUN in `integration-podman` on the NUC (see the commented job below). Tool versions
+# match gated's CI.
+#
+# Supply-chain hardening follow-up (tracked, not yet done): pin the `uses:` actions to
+# commit SHAs and install from a hash-locked requirements file (transitive pinning). Kept
+# on @v-tags for now to stay in step with the gated/mori sibling workflows.
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: read-only by default. The private gated checkout uses an explicit scoped
+# token and does NOT persist it into .git/config (persist-credentials: false on every step).
+permissions:
+  contents: read
+
+env:
+  # conftest._GATED_DEV / orchestrator.gated_pin._PINNED_COMMIT (gated 3.5 S3-completion).
+  GATED_PIN: 1d75d54a97986e18fae499c370f8615e6cf89e15
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install "ruff==0.15.15"
+      - run: ruff check .
+
+  typecheck:
+    name: Types (mypy --strict, real gated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout gated-uat
+        uses: actions/checkout@v5
+        with:
+          path: gated-uat
+          persist-credentials: false
+      - name: Checkout gated @ pin (private — read-only token, creds NOT persisted)
+        uses: actions/checkout@v5
+        with:
+          repository: fjwood69/gated
+          ref: ${{ env.GATED_PIN }}
+          token: ${{ secrets.GATED_PIN_TOKEN }}
+          path: gated-uat-pin
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install "mypy==2.1.0" "pynacl==1.5.0"
+      # Real gated on MYPYPATH — gate.*/core.* are checked as REAL types, not Any: strict means
+      # strict against the actual interfaces the harness depends on, not a stubbed surface.
+      - name: mypy --strict
+        working-directory: gated-uat
+        env:
+          MYPYPATH: ${{ github.workspace }}/gated-uat-pin
+        run: mypy --strict orchestrator cli.py conftest.py
+
+  test:
+    name: Core tests (py ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Floor (requires-python>=3.11) + latest. Hosted runs exercise the core logic only
+        # (podman tests self-skip), so two versions give the useful coverage.
+        python-version: ["3.11", "3.13"]
+    steps:
+      # gated-uat and its pinned gated dependency must be SIBLINGS under $GITHUB_WORKSPACE:
+      # conftest resolves ../gated-uat-pin relative to the repo root.
+      - name: Checkout gated-uat
+        uses: actions/checkout@v5
+        with:
+          path: gated-uat
+          persist-credentials: false
+      - name: Checkout gated @ pin (private — read-only token, creds NOT persisted)
+        uses: actions/checkout@v5
+        with:
+          repository: fjwood69/gated
+          ref: ${{ env.GATED_PIN }}
+          token: ${{ secrets.GATED_PIN_TOKEN }}
+          path: gated-uat-pin
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      # The one vetted dependency (the security path): PyNaCl / libsodium Ed25519 — used by
+      # both the harness (orchestrator/trust.py) and gated (gate/signing.py).
+      - run: pip install "pynacl==1.5.0" "pytest==9.0.3"
+      # conftest injects ../gated-uat-pin + verifies the EXACT pin & clean tree. Podman-gated
+      # OCI tests self-skip here (no podman); the falsifiability-core suite runs.
+      - name: pytest (core logic; podman tests self-skip)
+        working-directory: gated-uat
+        run: python -m pytest -q -W error::RuntimeWarning
+
+  # AUTHORITATIVE integration gate (review P1 #2): the podman-gated enforcement scenarios
+  # that self-skip on hosted runners RUN here with REAL podman + the gated worktree, on a
+  # TRUSTED SELF-HOSTED runner (the NUC). Restricted to push-to-main — a persistent
+  # self-hosted runner must NEVER execute untrusted fork-PR code.
+  #
+  # ENABLE once a self-hosted runner is registered on the NUC with labels
+  # [self-hosted, nuc, podman] and the localhost/mori:local + localhost/mori-uat:local
+  # images present. Committed disabled so the hosted CI can be green before the runner
+  # exists (a job with no matching runner would hang the whole workflow).
+  #
+  # integration-podman:
+  #   name: Integration (real podman, self-hosted NUC)
+  #   if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  #   runs-on: [self-hosted, nuc, podman]
+  #   timeout-minutes: 40
+  #   steps:
+  #     - name: Checkout gated-uat
+  #       uses: actions/checkout@v5
+  #       with:
+  #         path: gated-uat
+  #         persist-credentials: false
+  #     - name: Checkout gated @ pin
+  #       uses: actions/checkout@v5
+  #       with:
+  #         repository: fjwood69/gated
+  #         ref: ${{ env.GATED_PIN }}
+  #         token: ${{ secrets.GATED_PIN_TOKEN }}
+  #         path: gated-uat-pin
+  #         persist-credentials: false
+  #     - uses: actions/setup-python@v6
+  #       with:
+  #         python-version: "3.13"
+  #     - run: pip install "pynacl==1.5.0" "pytest==9.0.3"
+  #     # podman present -> the enforcement scenarios (ABA / subject-drift / tamper / admit)
+  #     # run for real; the full 175-test suite is the authoritative merge gate.
+  #     - name: pytest (FULL — real-podman enforcement scenarios)
+  #       working-directory: gated-uat
+  #       run: python -m pytest -q -W error::RuntimeWarning

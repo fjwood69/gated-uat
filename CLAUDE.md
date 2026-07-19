@@ -31,7 +31,7 @@ git push https://fjwood69:${GITHUB_TOKEN}@github.com/fjwood69/gated-uat.git
 
 ## Pinned gated dependency
 
-The harness depends on `gated` at commit `628e5a3d8274a74bb74cecaf7667fdf989398ebd`
+The harness depends on `gated` at commit `1d75d54a97986e18fae499c370f8615e6cf89e15`
 (gated 3.5 S3 ckpt3: trust + guard policy provenance through CalibrationResult).
 
 One-time worktree setup (already done — do not repeat):
@@ -39,7 +39,7 @@ One-time worktree setup (already done — do not repeat):
 ```bash
 git -C /home/nucadmin/gated worktree add --detach \
     /home/nucadmin/gated-uat-pin \
-    628e5a3d8274a74bb74cecaf7667fdf989398ebd
+    1d75d54a97986e18fae499c370f8615e6cf89e15
 ```
 
 `conftest.py` adds `gated-uat-pin` to `sys.path` on every pytest run and calls
@@ -48,7 +48,7 @@ A dirty tree or mismatched commit is a **hard rejection**.
 
 If the worktree is missing (e.g. after a machine wipe), recreate it with the command
 above.  The `gated` source repo at `/home/nucadmin/gated` must be on step-3.5-jobs
-(Fab's branch) — not checked out to 628e5a3 itself.
+(Fab's branch) — not checked out to 1d75d54 itself.
 
 ## Phase status
 
@@ -103,7 +103,7 @@ If `.Id` is missing the `sha256:` prefix, prepend it manually.
 
 ## gated API surface (what the adapter bridges)
 
-All of this lives at `/home/nucadmin/gated-uat-pin` (pinned commit `628e5a3`).
+All of this lives at `/home/nucadmin/gated-uat-pin` (pinned commit `1d75d54`).
 The gitnexus index for `gated` (path `/home/nucadmin/gated`, branch `step-3.5-jobs`)
 is the authoritative call-graph reference for these symbols.
 
@@ -162,7 +162,7 @@ Keep old validators so archived receipts remain cryptographically verifiable.
 
 ## git discipline
 
-- Commit-pin enforcement means `gated-uat-pin` must stay at `628e5a3d...` — if you
+- Commit-pin enforcement means `gated-uat-pin` must stay at `1d75d54d...` — if you
   need to test against a newer gated commit, that is a Phase 2 decision, not a local
   workaround.  Update `_PINNED_COMMIT` in `gated_pin.py`, then move the pin worktree.
 - Before any git op, check `git -C /home/nucadmin/gated-uat status` first.
@@ -185,3 +185,48 @@ The `ai-stack` index is stale for `mori-verse` work (branch `mori-verse-3.3-tier
 ```bash
 node .gitnexus/run.cjs analyze
 ```
+
+<!-- gitnexus:start -->
+# GitNexus — Code Intelligence
+
+This project is indexed by GitNexus as **gated-uat** (997 symbols, 2067 relationships, 44 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+
+> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+
+## Always Do
+
+- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
+- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
+- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
+- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
+- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
+- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
+
+## Never Do
+
+- NEVER edit a function, class, or method without first running `impact` on it.
+- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
+- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
+- NEVER commit changes without running `detect_changes()` to check affected scope.
+
+## Resources
+
+| Resource | Use for |
+|----------|---------|
+| `gitnexus://repo/gated-uat/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/gated-uat/clusters` | All functional areas |
+| `gitnexus://repo/gated-uat/processes` | All execution flows |
+| `gitnexus://repo/gated-uat/process/{name}` | Step-by-step execution trace |
+
+## CLI
+
+| Task | Read this skill file |
+|------|---------------------|
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
+| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
+| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
+| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
+| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+
+<!-- gitnexus:end -->
