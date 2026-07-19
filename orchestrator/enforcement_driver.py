@@ -133,7 +133,13 @@ def seed_enabled_policy(
         detector_id, lambda: RetryCheck(retry_entry),
         accepted_profile_digest=ACCEPTED_RETRYCHECK_PROFILE_DIGEST,
     )
-    make_sb, backend_guard = guarded_backend("observed", image_ref, guard_policy=guard_policy)
+    # UAT-2 (config-ID before seeding): resolve a possibly-MUTABLE tag to its immutable OCI
+    # image-config id BEFORE calibration, mirroring the enforcement path's launch-by-config-ID.
+    # Calibration already records + binds the image that actually executed (so a moved tag is not a
+    # provenance bypass), but anchoring to the digest up front removes the mutable-tag intent-drift
+    # window between seeding and the run.
+    seed_image_id = _resolve_image_config_id(image_ref)
+    make_sb, backend_guard = guarded_backend("observed", seed_image_id, guard_policy=guard_policy)
     trust_policy = resolve_trust_policy("trust-policy:completed-only")
 
     def _appr(op: str) -> Any:
@@ -446,7 +452,10 @@ class GatedEnforcementAdapter:
         event = GatingEvent(
             delivery_id=config.delivery_id, repo_full_name=config.repo_full_name,
             head_sha=config.head_sha, action=config.action,
-            installation_id=config.installation_id)
+            installation_id=config.installation_id,
+            # UAT-3: set explicitly rather than relying on GatingEvent's default — _event_digest
+            # hashes head_repo_full_name, so the digest must not silently move if the default moves.
+            head_repo_full_name=None)
         event_digest = _event_digest(event)
         expected = expected_for(config.scenario)
         corpus_version = seed.pinned_set_version
