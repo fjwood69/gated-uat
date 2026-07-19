@@ -47,6 +47,11 @@ from orchestrator.schemas import (
 )
 
 from ._aba_scheduler import AbaInjectionScheduler
+from ._currency_schedulers import (
+    LiveAttestationUnavailableScheduler,
+    OracleUnavailableScheduler,
+    SetHeadStaleScheduler,
+)
 from ._tamper_scheduler import TamperInjectionScheduler
 
 _IMAGE_REF = "localhost/mori:local"
@@ -444,6 +449,136 @@ class CustomSourceAdmittedRefutationTests(unittest.TestCase):
         self.assertEqual(pp["expected_kind"], "non_run")
         self.assertEqual(pp["expected_reason"], "block_action_required")
         self.assertTrue((tmp / "runs" / chain.prereg.run_id / "prereg.json").exists())
+
+
+def _fresh_bad(fixture_id: str) -> Fixture:
+    """A KNOWN_BAD fixture NOT already in the seeded set (the SET_HEAD_STALE excursion fixture)."""
+    return Fixture(
+        fixture_id=fixture_id, label=FixtureLabel.KNOWN_BAD,
+        payload=(_CORPUS / "retry-swallow-v1" / "main.py").read_bytes(),
+        evasion_class="exception-swallowing")
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class SetHeadStaleScenarioEvidenceTests(unittest.TestCase):
+    """SET_HEAD_STALE (slice 2.2a, Class A): a real fixture append between plan-mint and admit moves
+    the live set_head off the bound head → admit refuses set_head_stale. A completed run rejected at
+    admission (blocking_refusal, run_verdict), and the harness's own path judges it admissible."""
+
+    def test_set_head_stale_yields_signed_admissible_refusal(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-stale-"))
+        ps, cs, prov = _seed(tmp)
+        signing_key = SigningKey.generate()
+        sched = SetHeadStaleScheduler(
+            real_cs=cs, policy_id="uat-enforce", set_id=prov.set_id,
+            artifact_dir=_CORPUS / "retry-good-v1", fresh_fixture=_fresh_bad("stale-freshbad"))
+        # NEGATIVE CONTROL (disarmed passthrough): the wrapper is transparent until armed, so the
+        # refusal comes from the ARMED injection at admit, not the wrapper's mere presence.
+        self.assertEqual(sched.calibration_store.set_head(prov.set_id), cs.set_head(prov.set_id))
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.SET_HEAD_STALE, policy_store=ps,
+            calibration_store=sched.calibration_store, seed=prov, image_ref=_IMAGE_REF,
+            artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs", signing_key=signing_key,
+            verify_key=signing_key.verify_key, registry=Registry(tmp / "registry.db"),
+            head_sha="a" * 40, trials=1, budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=sched.artifact_source, fault_scheduler=sched)
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        self.assertEqual(outcome.result_kind, "blocking_refusal")
+        self.assertEqual(outcome.reason, "set_head_stale")
+        self.assertEqual(outcome.sub_reason, "")
+        self.assertTrue(chain.is_admitted)
+        ep = chain.execution.payload
+        self.assertEqual(ep["gate_outcome"], "run_verdict")  # a completed run refused at admission
+        # the plan WAS minted (disarmed passthrough) — the injection fired POST-mint at admit
+        self.assertEqual(ep["plan_policy_id"], "uat-enforce")
+        disc = sched.require_completed_disclosure()  # INTERLEAVE PROOF: fired at the oracle read
+        self.assertIn("oracle_head_for", disc["locus"])
+        self.assertEqual(ep["fault_injection"], disc)
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class OracleUnavailableScenarioEvidenceTests(unittest.TestCase):
+    """ORACLE_UNAVAILABLE (slice 2.2a, Class B fault simulation): the armed cs.set_head RAISES the
+    exact ChainIntegrityError CalibrationStore.set_head raises on a real store fault; admit maps any
+    oracle_head_for exception to oracle_unavailable / store_unreachable."""
+
+    def test_oracle_unavailable_yields_signed_admissible_refusal(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-oracle-"))
+        ps, cs, prov = _seed(tmp)
+        signing_key = SigningKey.generate()
+        sched = OracleUnavailableScheduler(
+            real_cs=cs, policy_id="uat-enforce", set_id=prov.set_id,
+            artifact_dir=_CORPUS / "retry-good-v1")
+        # NEGATIVE CONTROL (disarmed passthrough): disarmed set_head returns the real head, no fault
+        # — transparent until armed.
+        self.assertEqual(sched.calibration_store.set_head(prov.set_id), cs.set_head(prov.set_id))
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.ORACLE_UNAVAILABLE, policy_store=ps,
+            calibration_store=sched.calibration_store, seed=prov, image_ref=_IMAGE_REF,
+            artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs", signing_key=signing_key,
+            verify_key=signing_key.verify_key, registry=Registry(tmp / "registry.db"),
+            head_sha="a" * 40, trials=1, budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=sched.artifact_source, fault_scheduler=sched)
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        self.assertEqual(outcome.result_kind, "blocking_refusal")
+        self.assertEqual(outcome.reason, "oracle_unavailable")
+        self.assertEqual(outcome.sub_reason, "store_unreachable")  # raise path, not unresolved
+        self.assertTrue(chain.is_admitted)
+        ep = chain.execution.payload
+        self.assertEqual(ep["gate_outcome"], "run_verdict")
+        self.assertEqual(ep["plan_policy_id"], "uat-enforce")
+        disc = sched.require_completed_disclosure()
+        self.assertIn("oracle_head_for", disc["locus"])
+        self.assertEqual(ep["fault_injection"], disc)
+
+
+@unittest.skipUnless(
+    _podman_image_available(_IMAGE_REF), f"{_IMAGE_REF} not present in Podman image store"
+)
+class LiveAttestationUnavailableScenarioEvidenceTests(unittest.TestCase):
+    """LIVE_ATTESTATION_UNAVAILABLE (slice 2.2a, Class A): a real ENABLED→DEGRADED transition at the
+    attestation read, then CALL THROUGH — the real snapshot returns None (policy no longer ENABLED),
+    so admit refuses live_attestation_unavailable / attestation_absent."""
+
+    def test_live_attestation_unavailable_yields_signed_admissible_refusal(self) -> None:
+        tmp = Path(tempfile.mkdtemp(prefix="mv-uat-liveattn-"))
+        ps, cs, prov = _seed(tmp)
+        signing_key = SigningKey.generate()
+        sched = LiveAttestationUnavailableScheduler(
+            real_ps=ps, policy_id="uat-enforce", set_id=prov.set_id,
+            artifact_dir=_CORPUS / "retry-good-v1")
+        # NEGATIVE CONTROL (disarmed passthrough): disarmed snapshot returns the real ENABLED tuple.
+        self.assertEqual(
+            sched.policy_store.current_attestation_snapshot("uat-enforce"),
+            ps.current_attestation_snapshot("uat-enforce"))
+
+        config = EnforcementRunConfig(
+            scenario=ScenarioId.LIVE_ATTESTATION_UNAVAILABLE, policy_store=sched.policy_store,
+            calibration_store=cs, seed=prov, image_ref=_IMAGE_REF,
+            artifact_dir=_CORPUS / "retry-good-v1", runs_dir=tmp / "runs", signing_key=signing_key,
+            verify_key=signing_key.verify_key, registry=Registry(tmp / "registry.db"),
+            head_sha="a" * 40, trials=1, budget=ResourceBudget(wall_clock_seconds=120.0),
+            artifact_source=sched.artifact_source, fault_scheduler=sched)
+        outcome, chain = GatedEnforcementAdapter().enforce(config)
+
+        self.assertEqual(outcome.result_kind, "blocking_refusal")
+        self.assertEqual(outcome.reason, "live_attestation_unavailable")
+        self.assertEqual(outcome.sub_reason, "attestation_absent")
+        self.assertTrue(chain.is_admitted)
+        ep = chain.execution.payload
+        self.assertEqual(ep["gate_outcome"], "run_verdict")
+        self.assertEqual(ep["plan_policy_id"], "uat-enforce")
+        disc = sched.require_completed_disclosure()
+        self.assertIn("current_attestation", disc["locus"])
+        self.assertEqual(ep["fault_injection"], disc)
 
 
 class WiringPinTests(unittest.TestCase):

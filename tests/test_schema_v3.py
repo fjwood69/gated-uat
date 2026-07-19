@@ -27,7 +27,14 @@ from orchestrator.evidence import (
     build_teardown_receipt,
     verify_integrity,
 )
-from orchestrator.expectations import ScenarioId, expected_for
+from orchestrator.expectations import (
+    INJECTION_CLASS,
+    InjectionClass,
+    ScenarioId,
+    assert_inducible,
+    expected_for,
+    injection_class_for,
+)
 from orchestrator.schemas import (
     SchemaCoherenceError,
     SchemaViolationError,
@@ -50,7 +57,17 @@ _EXPECTED_KIND = {
     ScenarioId.ABA_GENERATION_MOVED: "blocking_refusal",
     ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE: "blocking_refusal",
     ScenarioId.SHA_TAMPER: "infrastructure_failure",
+    # slice 2.2a — post-run admission-currency refusals (all blocking_refusal).
+    ScenarioId.SET_HEAD_STALE: "blocking_refusal",
+    ScenarioId.ORACLE_UNAVAILABLE: "blocking_refusal",
+    ScenarioId.LIVE_ATTESTATION_UNAVAILABLE: "blocking_refusal",
 }
+
+# scenarios whose fault_injection is the BASE triple (tamper + the three 2.2a currency injections).
+_BASE_TRIPLE_FAULT = frozenset({
+    ScenarioId.SHA_TAMPER, ScenarioId.SET_HEAD_STALE,
+    ScenarioId.ORACLE_UNAVAILABLE, ScenarioId.LIVE_ATTESTATION_UNAVAILABLE,
+})
 
 
 def _seed_trace(scenario: ScenarioId) -> dict[str, Any]:
@@ -126,8 +143,8 @@ def _exec(scenario: ScenarioId, observed_kind: str, *, result_reason: str, outco
     # CONFIGURED / FAULT-INJECTION by scenario (what the harness did).
     if scenario is ScenarioId.ABA_GENERATION_MOVED:
         p["fault_injection"] = _aba_fault_injection()
-    elif scenario is ScenarioId.SHA_TAMPER:
-        p["fault_injection"] = _tamper_fault_injection()
+    elif scenario in _BASE_TRIPLE_FAULT:
+        p["fault_injection"] = _tamper_fault_injection()  # the base triple
     elif scenario is ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE:
         p["drift_image_digest"] = _SHA_RUN
     # OBSERVED by kind (what the SUT produced).
@@ -409,6 +426,32 @@ class ContinuityTests(unittest.TestCase):
         with self.assertRaises(SemanticContinuityError):
             _chain(_prereg(ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE),
                    _matched_exec(ScenarioId.ABA_GENERATION_MOVED))
+
+
+class TaxonomyTests(unittest.TestCase):
+    """slice 2.2: the injection taxonomy is an ENFORCEABLE invariant, not a slogan. Every ScenarioId
+    declares a non-FABRICATION class, and the guard rejects a FABRICATION-classed scenario."""
+
+    def test_every_scenario_is_classified_and_inducible(self) -> None:
+        for scenario in ScenarioId:
+            with self.subTest(scenario=scenario):
+                # completeness: every id is in the table (KeyError otherwise) ...
+                cls = injection_class_for(scenario)
+                # ... and none is FABRICATION — the harness only drives gated's REAL path.
+                self.assertIsNot(cls, InjectionClass.FABRICATION)
+                assert_inducible(scenario)  # does not raise
+
+    def test_assert_inducible_rejects_a_fabrication_classed_scenario(self) -> None:
+        # the guard has TEETH: temporarily reclassify a scenario as FABRICATION and confirm the
+        # loader refuses to run it (no FABRICATION ScenarioId exists, so this proves the check).
+        victim = ScenarioId.COMPLIANT_ADMIT
+        original = INJECTION_CLASS[victim]
+        INJECTION_CLASS[victim] = InjectionClass.FABRICATION
+        try:
+            with self.assertRaises(ValueError):
+                assert_inducible(victim)
+        finally:
+            INJECTION_CLASS[victim] = original
 
 
 if __name__ == "__main__":
