@@ -16,7 +16,9 @@ from typing import Any
 
 from nacl.signing import SigningKey
 
+from conftest import build_receipt_unchecked  # a signed receipt over a schema-invalid payload
 from orchestrator.evidence import (
+    ChainVerificationError,
     SemanticContinuityError,
     VerifiedChain,
     build_execution_receipt,
@@ -200,6 +202,52 @@ class SchemaMatrixTests(unittest.TestCase):
         p["seed_trace"]["seed_image_digest"] = "not-a-digest"
         with self.assertRaises(SchemaViolationError):
             validate_execution_payload_v3(p)
+
+
+class KeyOmissionTests(unittest.TestCase):
+    """UAT-1: a v3 MATRIX cell's key set is EXACT — every key is required-PRESENT. Omitting
+    plan_policy_id or gate_outcome must be REJECTED. Previously a MISSING plan_policy_id passed for
+    admitted/refusal/infra rows because ``payload.get(..., '<absent>')`` yielded a truthy string;
+    continuity then read None and SKIPPED the plan==configured comparison — silently disabling the
+    guarantee that the executed plan matched the configured policy. Omission negatives across EVERY
+    result kind (via the per-scenario matched cells, which span admitted/non_run/refusal/infra)."""
+
+    def test_omitted_plan_policy_id_rejected_across_every_kind(self) -> None:
+        for scenario in ScenarioId:
+            with self.subTest(scenario=scenario, kind=_EXPECTED_KIND[scenario]):
+                p = _matched_exec(scenario)
+                del p["plan_policy_id"]  # even the non_run's explicit null must be PRESENT
+                with self.assertRaises(SchemaViolationError):
+                    validate_execution_payload_v3(p)
+
+    def test_omitted_gate_outcome_rejected_across_every_kind(self) -> None:
+        for scenario in ScenarioId:
+            with self.subTest(scenario=scenario, kind=_EXPECTED_KIND[scenario]):
+                p = _matched_exec(scenario)
+                del p["gate_outcome"]  # even infra's explicit null must be PRESENT
+                with self.assertRaises(SchemaViolationError):
+                    validate_execution_payload_v3(p)
+
+    def test_signed_receipt_omitting_plan_policy_id_fails_verify_integrity(self) -> None:
+        # The finding's EXACT threat: a faulty trusted producer SIGNS an execution receipt that
+        # OMITS plan_policy_id (crypto-valid, schema-invalid). The signature stops an external
+        # editor; it is the harness's OWN verify_integrity that must reject a PROHIBITED OMISSION at
+        # schema validation — not accept it and let continuity skip. (build_execution_receipt now
+        # rejects it at BUILD too; build_receipt_unchecked bypasses that to hit the verify gate.)
+        sk = SigningKey.generate()
+        rid = "22222222-2222-4222-8222-222222222222"
+        prereg = build_receipt("prereg", rid, _prereg(ScenarioId.COMPLIANT_ADMIT), sk)
+        exec_payload = _matched_exec(ScenarioId.COMPLIANT_ADMIT)
+        del exec_payload["plan_policy_id"]
+        exec_payload["prereg_digest"] = prereg.digest  # the binding build_execution_receipt injects
+        execution = build_receipt_unchecked("execution", rid, exec_payload, sk)
+        teardown = build_teardown_receipt(execution, {
+            "schema_version": 3, "profile": "p1", "failure": False,
+            "torn_down_at": _ISO, "runtime_pack_digest": _HEX}, sk)
+        index = build_index(rid, prereg, execution, teardown, sk, sk.verify_key.encode().hex())
+        with self.assertRaises(ChainVerificationError) as cm:
+            verify_integrity(prereg, execution, teardown, index, sk.verify_key)
+        self.assertIn("schema violation", str(cm.exception).lower())
 
 
 class AbaEvidenceTests(unittest.TestCase):

@@ -337,6 +337,25 @@ def _check_unknown_keys(payload: dict[str, Any], allowed: frozenset[str], kind: 
         raise SchemaViolationError(f"{kind!r} payload has unknown keys: {sorted(unknown)}")
 
 
+def _check_exact_keys(payload: dict[str, Any], allowed: frozenset[str], kind: str) -> None:
+    """EXACT key-set equality: reject BOTH unknown (extra) AND missing (required) keys. A v3 MATRIX
+    cell's key set is exhaustive — every key is required-PRESENT — so an OMITTED key is a malformed
+    record, never a permissible default (UAT-1: a missing plan_policy_id must not slip through a
+    truthy '<absent>' fallback and then silently disable the downstream continuity comparison). Used
+    ONLY for the v3 execution matrix; the legacy/teardown/prereg validators keep _check_unknown_keys
+    because they carry genuinely-optional fields and enforce presence per-field via _require."""
+    present = set(payload.keys())
+    unknown = present - allowed
+    missing = allowed - present
+    if unknown or missing:
+        parts = []
+        if missing:
+            parts.append(f"missing required keys: {sorted(missing)}")
+        if unknown:
+            parts.append(f"unknown keys: {sorted(unknown)}")
+        raise SchemaViolationError(f"{kind!r} payload {'; '.join(parts)}")
+
+
 def _validate_schema_version(payload: dict[str, Any], expected: int) -> None:
     sv = _require(payload, "schema_version", types=(int,))
     if sv != expected:
@@ -547,7 +566,12 @@ def _validate_result_discriminator(payload: dict[str, Any]) -> str:
     # (job_result.py: AdmittedRunResult/BlockingRefusal -> RUN_VERDICT; NonRunDecision ->
     # BLOCK_GATE|NEUTRAL_GATE by disposition; InfrastructureFailure -> None) so any real
     # map_job_result output validates and no honest observation is rejected.
-    gate_outcome = payload.get("gate_outcome", "<absent>")
+    # PRESENCE required (UAT-1): no '<absent>' default — a missing gate_outcome is malformed. (The
+    # coherence check below already fails an absent value closed; requiring presence is explicit.)
+    if "gate_outcome" not in payload:
+        raise SchemaViolationError("gate_outcome: required (a run_verdict|block_gate|neutral_gate "
+                                   "token, or an explicit null for infrastructure_failure)")
+    gate_outcome = payload["gate_outcome"]
     if kind == "non_run":
         want: str | None = {
             "block_action_required": "block_gate", "skip_neutral": "neutral_gate"}.get(reason)
@@ -565,7 +589,14 @@ def _validate_result_discriminator(payload: dict[str, Any]) -> str:
     # plan_policy_id — CAPTURED: an EXPLICIT null iff non_run (the SUT did not execute, so no plan
     # was captured); the captured plan's policy otherwise (never fabricated from the configured
     # policy). A captured plan under a non_run is a provenance contradiction (integrity fail).
-    plan_policy_id = payload.get("plan_policy_id", "<absent>")
+    # PRESENCE required (UAT-1): NO '<absent>' default. A missing key previously became the truthy
+    # string "<absent>", passing the "non-empty policy id" check for admitted/refusal/infra — and
+    # continuity then saw None and SKIPPED the plan==configured comparison. Require the key present,
+    # then validate an explicit null (iff non_run) or a non-empty policy id.
+    if "plan_policy_id" not in payload:
+        raise SchemaViolationError(
+            "plan_policy_id: required — an explicit null iff non_run, else the captured policy id")
+    plan_policy_id = payload["plan_policy_id"]
     if kind == "non_run":
         if plan_policy_id is not None:
             raise SchemaViolationError(
@@ -624,7 +655,9 @@ def validate_execution_payload_v3(payload: dict[str, Any]) -> None:
     if result_kind not in VALID_RESULT_KINDS:
         raise SchemaViolationError(
             f"result_kind: must be one of {sorted(VALID_RESULT_KINDS)}, got {result_kind!r}")
-    _check_unknown_keys(payload, execution_keys_for(scenario, result_kind), "execution")
+    # EXACT key-set (UAT-1): every matrix-cell key is required-PRESENT (not just no-extras), so a
+    # missing plan_policy_id / gate_outcome cannot pass on a truthy default and disable continuity.
+    _check_exact_keys(payload, execution_keys_for(scenario, result_kind), "execution")
     _validate_schema_version(payload, 3)
     _validate_execution_common(payload)  # profile/gated_commit/outcome/executed_at/digest/prereg
     if not _require(payload, "configured_policy_id", types=(str,)):
