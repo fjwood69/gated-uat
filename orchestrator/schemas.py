@@ -193,7 +193,19 @@ _SCENARIO_CONFIGURED: dict[str, frozenset[str]] = {
     ScenarioId.ABA_GENERATION_MOVED.value: frozenset({"fault_injection"}),
     ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE.value: frozenset({"drift_image_digest"}),
     ScenarioId.SHA_TAMPER.value: frozenset({"fault_injection"}),
+    # slice 2.2a — each injecting scenario discloses a base-triple fault_injection (like tamper):
+    # the scheduler's COMPLETED induction record of what was done at what interleave.
+    ScenarioId.SET_HEAD_STALE.value: frozenset({"fault_injection"}),
+    ScenarioId.ORACLE_UNAVAILABLE.value: frozenset({"fault_injection"}),
+    ScenarioId.LIVE_ATTESTATION_UNAVAILABLE.value: frozenset({"fault_injection"}),
 }
+
+# slice 2.2a: the scenarios whose fault_injection is the BASE triple (locus/mechanism/interleave) —
+# the tamper + the three admission-currency injections. ABA uses the richer 5-head shape (M4).
+_BASE_TRIPLE_FAULT_SCENARIOS: frozenset[str] = frozenset({
+    ScenarioId.SHA_TAMPER.value, ScenarioId.SET_HEAD_STALE.value,
+    ScenarioId.ORACLE_UNAVAILABLE.value, ScenarioId.LIVE_ATTESTATION_UNAVAILABLE.value,
+})
 
 # The measured coordinates only an ADMITTED run produces (from the authoritative engine return, not
 # the mutable report sink). OBSERVED-RESULT fields, keyed by the OBSERVED result_kind.
@@ -669,7 +681,7 @@ def validate_execution_payload_v3(payload: dict[str, Any]) -> None:
     # CONFIGURED / FAULT-INJECTION fields, keyed by SCENARIO (what the harness did).
     if scenario == ScenarioId.ABA_GENERATION_MOVED.value:
         _validate_aba_fault_injection(payload)
-    elif scenario == ScenarioId.SHA_TAMPER.value:
+    elif scenario in _BASE_TRIPLE_FAULT_SCENARIOS:
         fi = _require_nested(
             payload, "fault_injection", _FAULT_INJECTION_BASE_KEYS, "fault_injection")
         _require_nonempty_str_fields(fi, _FAULT_INJECTION_BASE_KEYS, "fault_injection")

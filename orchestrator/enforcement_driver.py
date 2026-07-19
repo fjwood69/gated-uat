@@ -43,11 +43,20 @@ from .evidence import (
     receipt_to_dict,
     verify_integrity,
 )
-from .expectations import ScenarioId, expected_for
+from .expectations import ScenarioId, assert_inducible, expected_for
 from .gated_pin import ACCEPTED_RETRYCHECK_PROFILE_DIGEST, verify_gated_dependency
 from .isolation import Registry, RunState
 from .runtime import compute_runtime_pack_digest, make_python_runtime_pack
 from .schemas import SCHEMA_VERSION_ENFORCEMENT
+
+# The scenarios that inject a fault via a scheduler and disclose it (require_completed_disclosure):
+# the ABA + tamper + the slice-2.2a admission-currency injections. A COMPLETED disclosure is
+# DEMANDED after the run; a half-fired injection raises there and aborts evidence.
+_FAULT_SCHEDULER_SCENARIOS: frozenset[ScenarioId] = frozenset({
+    ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SHA_TAMPER,
+    ScenarioId.SET_HEAD_STALE, ScenarioId.ORACLE_UNAVAILABLE,
+    ScenarioId.LIVE_ATTESTATION_UNAVAILABLE,
+})
 
 
 class EnforcementSeedError(RuntimeError):
@@ -436,6 +445,10 @@ class GatedEnforcementAdapter:
         )
         from gate.queue import GatingEvent
 
+        # (0) the taxonomy GUARD (slice 2.2): refuse a FABRICATION-classed scenario before anything
+        # runs — the harness only ever drives gated's REAL path, never a hand-built result.
+        assert_inducible(config.scenario)
+
         ps, cs = config.policy_store, config.calibration_store
         seed = config.seed
         policy_id = seed.policy_id
@@ -536,7 +549,7 @@ class GatedEnforcementAdapter:
             # propagating to the except (run FAILED) and aborting evidence — never serialising a
             # plausible refusal over an unknown-state fault.
             fault_disclosure: dict[str, str] | None = None
-            if config.scenario in (ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SHA_TAMPER):
+            if config.scenario in _FAULT_SCHEDULER_SCENARIOS:
                 fault_disclosure = config.fault_scheduler.require_completed_disclosure()
 
             # (i) build the MATRIX execution receipt + (j) teardown + (k) index; verify.
@@ -646,7 +659,7 @@ class GatedEnforcementAdapter:
             "gate_outcome": outcome.gate_outcome, "plan_policy_id": plan_policy_id,
             "seed_trace": _seed_trace(seed)}
         # CONFIGURED / FAULT-INJECTION by scenario — disclosed from the REAL machinery.
-        if scenario in (ScenarioId.ABA_GENERATION_MOVED, ScenarioId.SHA_TAMPER):
+        if scenario in _FAULT_SCHEDULER_SCENARIOS:
             if fault_disclosure is None:
                 raise EnforcementEvidenceError(
                     f"scenario {scenario.value!r} requires a COMPLETED fault disclosure from the "

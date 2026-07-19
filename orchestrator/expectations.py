@@ -38,6 +38,34 @@ class ScenarioId(Enum):
     ABA_GENERATION_MOVED = "aba_generation_moved"
     SUBJECT_DRIFT_SECOND_IMAGE = "subject_drift_second_image"
     SHA_TAMPER = "sha_tamper"
+    # slice 2.2a — more of gated's admission-currency refusal modes. All fire INSIDE
+    # admit_run_result (post-run), so all are blocking_refusal with gate_outcome run_verdict.
+    SET_HEAD_STALE = "set_head_stale"
+    ORACLE_UNAVAILABLE = "oracle_unavailable"
+    LIVE_ATTESTATION_UNAVAILABLE = "live_attestation_unavailable"
+
+
+class InjectionClass(Enum):
+    """How a scenario induces its outcome — the taxonomy that keeps 'drive gated's REAL path' an
+    ENFORCEABLE invariant, not a slogan (slice 2.2). Every ScenarioId declares one; the harness
+    REFUSES to run a FABRICATION-classed scenario (there are none — the member exists so the guard
+    has teeth). The classes:
+
+      REAL_INPUT       — no injected fault; a real (possibly distinct) input drives the outcome
+                         (a compliant run; a second real image).
+      STORE_MUTATION   — real writes through the real store APIs at a real interleave (the ABA;
+                         a real ENABLED→DEGRADED transition; a real fixture append).
+      FAULT_SIMULATION — a wrapper reproducing the EXACT failure a real component is contractually
+                         allowed to exhibit (e.g. CalibrationStore.set_head raising) — honest only
+                         with a fault-contract justification + a negative control.
+      FABRICATION      — hand-built JobResult/plan/report, or a value the real component's type
+                         cannot produce (e.g. set_head returning None). EXCLUDED — never an id.
+    """
+
+    REAL_INPUT = "real_input"
+    STORE_MUTATION = "store_mutation"
+    FAULT_SIMULATION = "fault_simulation"
+    FABRICATION = "fabrication"
 
 
 # The CLOSED expected-outcome vocabulary — literal tokens, hand-authored to match gated's emitted
@@ -79,6 +107,33 @@ EXPECTATIONS: dict[ScenarioId, Expected] = {
     # a TOCTOU tamper (mutate the tree after the SHA-bind) is caught by the sandbox re-verify → a
     # blocking infrastructure failure (never a silent pass).
     ScenarioId.SHA_TAMPER: Expected(_KIND_INFRA, "artifact_integrity_mismatch", ""),
+    # slice 2.2a — post-run admission-currency refusals. sub_reason is LOAD-BEARING: it forks each
+    # coarse reason (attestation_absent vs other; store_unreachable vs the None-return 'unresolved'
+    # path), so an empty sub_reason would blind the admissibility comparison to the forensic split.
+    # A real fixture append between mint and admit moves the live set_head off the bound head.
+    ScenarioId.SET_HEAD_STALE: Expected(_KIND_REFUSAL, "set_head_stale", ""),
+    # a real store fault at the live oracle read (set_head raises) — admit maps ANY oracle exception
+    # to oracle_unavailable/store_unreachable (the None-return path is a DISTINCT 'unresolved' sub).
+    ScenarioId.ORACLE_UNAVAILABLE: Expected(
+        _KIND_REFUSAL, "oracle_unavailable", "store_unreachable"),
+    # a real ENABLED→DEGRADED transition between mint and the attestation read → the REAL snapshot
+    # returns None (policy no longer ENABLED) → admit refuses live_attestation_unavailable/absent.
+    ScenarioId.LIVE_ATTESTATION_UNAVAILABLE: Expected(
+        _KIND_REFUSAL, "live_attestation_unavailable", "attestation_absent"),
+}
+
+
+# Every ScenarioId's INDUCTION class (slice 2.2). No FABRICATION entry — those modes are not
+# ScenarioIds; the guard (injection_class_for + assert_inducible) exists so the invariant has teeth.
+INJECTION_CLASS: dict[ScenarioId, InjectionClass] = {
+    ScenarioId.COMPLIANT_ADMIT: InjectionClass.REAL_INPUT,
+    ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE: InjectionClass.REAL_INPUT,
+    ScenarioId.NON_ENABLED_DEGRADED: InjectionClass.STORE_MUTATION,
+    ScenarioId.ABA_GENERATION_MOVED: InjectionClass.STORE_MUTATION,
+    ScenarioId.SHA_TAMPER: InjectionClass.STORE_MUTATION,  # a real post-hash artifact mutation
+    ScenarioId.SET_HEAD_STALE: InjectionClass.STORE_MUTATION,
+    ScenarioId.LIVE_ATTESTATION_UNAVAILABLE: InjectionClass.STORE_MUTATION,
+    ScenarioId.ORACLE_UNAVAILABLE: InjectionClass.FAULT_SIMULATION,
 }
 
 
@@ -88,4 +143,22 @@ def expected_for(scenario: ScenarioId) -> Expected:
     return EXPECTATIONS[scenario]
 
 
-__all__ = ["ScenarioId", "Expected", "EXPECTATIONS", "expected_for"]
+def injection_class_for(scenario: ScenarioId) -> InjectionClass:
+    """The induction class ``scenario`` declares. KeyError for an unclassified scenario (a
+    completeness test pins every ScenarioId here)."""
+    return INJECTION_CLASS[scenario]
+
+
+def assert_inducible(scenario: ScenarioId) -> None:
+    """The load-time GUARD (slice 2.2): refuse to run a FABRICATION-classed scenario — the harness
+    drives gated's REAL path, so a hand-built JobResult/plan/report is never admissible evidence."""
+    if injection_class_for(scenario) is InjectionClass.FABRICATION:
+        raise ValueError(
+            f"scenario {scenario.value!r} is FABRICATION-classed — the harness refuses to run it; "
+            "a fabricated JobResult/plan/report is not a real gate decision")
+
+
+__all__ = [
+    "ScenarioId", "Expected", "EXPECTATIONS", "expected_for",
+    "InjectionClass", "INJECTION_CLASS", "injection_class_for", "assert_inducible",
+]
