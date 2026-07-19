@@ -144,9 +144,15 @@ def expected_for(scenario: ScenarioId) -> Expected:
 
 
 def injection_class_for(scenario: ScenarioId) -> InjectionClass:
-    """The induction class ``scenario`` declares. KeyError for an unclassified scenario (a
-    completeness test pins every ScenarioId here)."""
-    return INJECTION_CLASS[scenario]
+    """The induction class ``scenario`` declares. An unclassified scenario fails CLOSED with an
+    explicit error (not a bare KeyError) — a completeness test pins every ScenarioId here, so this
+    only fires if a NEW id is added without declaring how it drives the gate."""
+    try:
+        return INJECTION_CLASS[scenario]
+    except KeyError:
+        raise ValueError(
+            f"scenario {scenario.value!r} declares no InjectionClass — every ScenarioId MUST be "
+            "classified; refusing to run an unclassified scenario") from None
 
 
 def assert_inducible(scenario: ScenarioId) -> None:

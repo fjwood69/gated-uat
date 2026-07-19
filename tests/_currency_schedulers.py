@@ -179,7 +179,12 @@ class OracleUnavailableScheduler(_ArmedScheduler):
             return str(self._real.set_head(set_id))
         # the FIRE is the RAISE — the exact exception CalibrationStore.set_head raises on a
         # chain-verification failure (str-or-raise contract; never None). Record + COMPLETE, then
-        # raise (there is nothing that can fail before it, so no failure-catch is needed).
+        # raise (nothing can fail before it, so no failure-catch is needed). COMPLETED-before-raise
+        # is fail-closed BOTH ways (dissent): the scheduler does not resume after the raise (it
+        # unwinds through admit's oracle_head_for); if admit CATCHES it (the real contract) ->
+        # ORACLE_UNAVAILABLE + require_completed_disclosure finds COMPLETED; if a future refactor
+        # let it ESCAPE admit, it propagates out of enforce BEFORE any chain is built (no admissible
+        # chain), and the observed outcome would not match the predicted blocking_refusal anyway.
         self._state = _State.FIRING
         self._disclosure = {
             "locus": "admit_run_result.oracle_head_for(set_head)",
