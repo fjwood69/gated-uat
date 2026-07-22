@@ -368,6 +368,10 @@ VALID_STAGES: frozenset[str] = frozenset({"static", "own_tests", "llm_review", "
 # Cell-stage outcomes. ``blocked`` is the gate's BlockingRefusal projection — the payload of a
 # demonstration row (green-green-green-BLOCKED) and is VALID ONLY on the ``gate`` stage.
 VALID_CELL_OUTCOMES: frozenset[str] = frozenset({"pass", "fail", "error", "blocked"})
+# Reserved sentinel bound on a cell-level ERROR receipt when the artifact could NOT be safely
+# materialised or hashed. A sha256 preimage of all-zeros is cryptographically impossible, so it can
+# never collide with a real tree_hash; the sentinel schema law forces outcome=error + harness_error.
+UNMEASURABLE_TREE_DIGEST: str = "sha256:" + "0" * 64
 # Own-tests pytest status (derived OUT-OF-BAND from the container exit code, never producer output).
 VALID_PYTEST_STATUS: frozenset[str] = frozenset({"passed", "failed", "no_tests", "error"})
 # LLM reviewer's structured verdict (measurement, not a security boundary): strict approve → PASS.
@@ -1307,6 +1311,15 @@ def validate_cell_stage_payload(payload: dict[str, Any]) -> None:
     _require_iso_timestamp(payload, "executed_at")
     _require_hex64(payload, "code_sha")
     obs = _require(payload, "observation", types=(dict,))
+    # SENTINEL SCHEMA LAW (dissent gap 2b): the UNMEASURABLE sentinel digest (an artifact that could
+    # not be safely materialised/hashed) is signable ONLY on a harness-error ERROR receipt — a
+    # PASS/FAIL/BLOCKED receipt binding it is a lie (it certifies a measurement of a tree that was
+    # never measured) and is UNSIGNABLE. Bound structurally, not by the caller's discipline.
+    if artifact_tree_digest == UNMEASURABLE_TREE_DIGEST:
+        if outcome != "error" or set(obs) != {"harness_error"}:
+            raise SchemaViolationError(
+                "UNMEASURABLE_TREE_DIGEST is signable ONLY with outcome='error' + a harness_error "
+                f"observation — got outcome={outcome!r}, obs keys={sorted(obs)}")
     _validate_cell_observation(stage, obs, artifact_tree_digest, outcome)
     # gate outcome<->result_kind coherence: the outcome must be one the observed projection
     # produces.

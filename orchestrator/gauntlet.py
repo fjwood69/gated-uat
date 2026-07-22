@@ -59,16 +59,17 @@ from .evidence import Receipt, build_receipt
 from .schemas import (
     GATE_CELL_OUTCOME_BY_KIND,
     OWN_TESTS_CELL_OUTCOME,
+    UNMEASURABLE_TREE_DIGEST,
     expected_pytest_status,
 )
 
 CELL_STAGE_KIND = "cell_stage"
 # The ratified ordered gauntlet (build order == run order).
 GAUNTLET_STAGES: tuple[str, ...] = ("static", "own_tests", "llm_review", "gate")
-# Reserved sentinel digest bound on a cell-level ERROR receipt when the artifact could NOT be safely
-# materialised or hashed (unsafe tree / FIFO / missing / unreadable) — sha256 of all-zeros
-# is cryptographically impossible, so it can never collide with a real tree_hash.
-UNMEASURABLE_DIGEST = "sha256:" + "0" * 64
+# The reserved sentinel bound on a cell-level ERROR receipt when the artifact could NOT be safely
+# materialised or hashed. Canonical in schemas; the sentinel schema law forces outcome=error +
+# harness_error, so it can never sign a PASS/FAIL/BLOCKED.
+UNMEASURABLE_DIGEST = UNMEASURABLE_TREE_DIGEST
 
 
 class DigestMismatchError(RuntimeError):
@@ -81,6 +82,12 @@ class UnsafeArtifactError(ValueError):
     """The artifact tree contains a symlink / hardlink / special file — rejected up front (the SAME
     policy the gate's tarball extractor enforces) so the gauntlet's staging paths cannot diverge
     from the gate's on link representation (P1 hardening)."""
+
+
+class HarnessMisconfigError(RuntimeError):
+    """The cell could not be dispatched (e.g. stage_fns missing a required stage). Harness
+    misconfiguration is an OUTCOME the denominator must represent — caught inside the cell perimeter
+    and published as four ERROR receipts, never allowed to escape run_gauntlet (dissent gap 2a)."""
 
 
 # ------------------------------------------------------------------
@@ -347,25 +354,24 @@ def run_gauntlet(
     artifact); each stage materialises a fresh view from the seal. ``stage_fns`` maps each stage
     name to its closure (image, budget, reviewer).
 
-    CELL-LEVEL FAILURE PATH (dissent, amendment 2): the bound digest is computed BEFORE sealing so
-    that an unsafe-tree or seal failure still publishes an ERROR receipt for EVERY planned stage —
-    never a cell that vanishes from the denominator. The error path is a PUBLISHING path, not an
-    escape hatch; the bijection planned-cells<->terminal-receipts holds under every failure
-    geometry."""
-    missing = [s for s in GAUNTLET_STAGES if s not in stage_fns]
-    if missing:
-        raise ValueError(f"stage_fns missing required stage(s): {missing}")
-    # The preflight (assert_safe, lstat-only — no open) + the hash both live INSIDE the failure
-    # perimeter, and safety is asserted BEFORE any hash: a FIFO / device is rejected by lstat before
-    # ``_hash_file`` can block on it (the hang), a missing/unreadable path raises IO, and an
-    # unsafe tree raises — ALL of which publish four ERROR receipts (bound to the UNMEASURABLE
-    # sentinel, since the tree could not be safely hashed), so no cell vanishes from the denominator
-    # by raising OR by hanging. ``seal_artifact`` asserts-then-hashes in that safe order.
+    TOTAL CELL EXCEPTION PERIMETER (dissent gaps 1 + 2a): the ENTIRE per-cell dispatch — the
+    stage_fns configuration check, the preflight (assert_safe, lstat-only, no open — a FIFO is
+    rejected before ``_hash_file`` can block on it), the seal, and every stage — lives INSIDE one
+    catch-all whose contract is "publish four ERROR receipts or die trying". There is NO exception
+    type (harness misconfig / KeyError, unsafe tree, seal IO, hang-avoided-preflight, missing/
+    unreadable) that exits ``run_gauntlet`` without filling the cell. Raising is reserved for a
+    failure of the PUBLISHING machinery itself (``_error_receipt``) — at which point the run is
+    UNATTESTABLE and the board must not render, the correct terminal. The ERROR receipts bind the
+    UNMEASURABLE sentinel (the tree was not safely measured); the sentinel schema law forces
+    outcome=error + harness_error."""
     try:
+        missing = [s for s in GAUNTLET_STAGES if s not in stage_fns]
+        if missing:
+            raise HarnessMisconfigError(f"stage_fns missing required stage(s): {missing}")
         with seal_artifact(artifact_dir) as sealed:
             return [run_stage(cell, sealed, sealed.digest, s, stage_fns[s], signing_key)
                     for s in GAUNTLET_STAGES]
-    except (UnsafeArtifactError, SealError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 — NO exit without filling the cell (four ERROR receipts)
         return [_error_receipt(cell, s, UNMEASURABLE_DIGEST,
                                f"cell_failure: {type(exc).__name__}: {exc}", signing_key)
                 for s in GAUNTLET_STAGES]
