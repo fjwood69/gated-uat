@@ -137,6 +137,42 @@ def test_unsafe_tree_publishes_error_for_every_stage(tmp_path: Path) -> None:
         validate_payload("cell_stage", r.payload)
 
 
+def test_harness_misconfig_publishes_error_for_every_stage(tmp_path: Path) -> None:
+    # dissent gap 2a: a missing stage_fns entry is harness misconfig -> 4 ERROR receipts, not a
+    # raise that lets the cell escape the denominator.
+    s = generate_signer()
+    (tmp_path / "a.py").write_text("x = 1\n")
+
+    def ok(_v: Path) -> StageObservation:
+        return StageObservation("static", "pass", {
+            "tool_versions": {}, "ruff_exit": 0, "mypy_exit": 0, "findings_count": 0})
+
+    incomplete = {"static": ok, "own_tests": ok, "llm_review": ok}  # 'gate' missing
+    receipts = run_gauntlet(_cell(), tmp_path, incomplete, s.signing_key)
+    assert [r.payload["stage"] for r in receipts] == list(GAUNTLET_STAGES)
+    assert all(r.payload["outcome"] == "error" for r in receipts)
+    assert all("HarnessMisconfigError" in r.payload["observation"]["harness_error"]
+               for r in receipts)
+    for r in receipts:
+        validate_payload("cell_stage", r.payload)
+
+
+def test_unmeasurable_sentinel_signable_only_with_error(tmp_path: Path) -> None:
+    # dissent gap 2b: the UNMEASURABLE sentinel binds ONLY to outcome=error + harness_error.
+    from orchestrator.gauntlet import build_cell_stage_receipt
+    from orchestrator.schemas import UNMEASURABLE_TREE_DIGEST
+    key = generate_signer().signing_key
+    # legit: error + harness_error -> signs
+    build_cell_stage_receipt(_cell(), "static", "error", {"harness_error": "unmeasurable"},
+                             UNMEASURABLE_TREE_DIGEST, key)
+    # a PASS receipt binding the sentinel is a lie -> UNSIGNABLE
+    with pytest.raises(SchemaViolationError):
+        build_cell_stage_receipt(
+            _cell(), "static", "pass",
+            {"tool_versions": {}, "ruff_exit": 0, "mypy_exit": 0, "findings_count": 0},
+            UNMEASURABLE_TREE_DIGEST, key)
+
+
 # ---- TOOLCHAIN PIN: enforced, not just recorded ----
 
 def test_static_toolchain_digest_pin_enforced(tmp_path: Path) -> None:
