@@ -20,13 +20,14 @@ from orchestrator.manifest import (
     DenominatorIncompleteError,
     ManifestVerificationError,
     assert_denominator_complete,
+    assert_stage_denominator_complete,
     build_manifest,
     build_manifest_payload,
     plan_cells,
     planned_run_ids,
     verify_manifest,
 )
-from orchestrator.schemas import SchemaViolationError, validate_payload
+from orchestrator.schemas import VALID_STAGES, SchemaViolationError, validate_payload
 from orchestrator.trust import generate_signer
 
 _TS = datetime(2026, 7, 22, 10, 0, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
@@ -52,14 +53,20 @@ def _denom(n: int = 2) -> dict:
             "retry_policy": "none", "infra_failure_disposition": "error_and_publish"}
 
 
-def _payload(tasks=None, denom=None, cells=None, n: int = 2) -> dict:
+def _toolchain() -> dict:
+    return {"python_version": "3.12.3", "ruff_version": "0.6.0", "mypy_version": "1.11.0",
+            "env_digest": "sha256:" + "1" * 64}
+
+
+def _payload(tasks=None, denom=None, cells=None, n: int = 2, toolchain=None) -> dict:
     tasks = tasks if tasks is not None else _tasks()
     denom = denom if denom is not None else _denom(n)
     cells = cells if cells is not None else plan_cells(
         [(t["task_id"], t["side"]) for t in tasks], _LINEAGES, n)
     return build_manifest_payload(
         gated_commit="1d75d54", code_sha="d" * 64, corpus_version="retry-v1",
-        preregistered_at=_TS, tasks=tasks, denominator=denom, cells=cells)
+        preregistered_at=_TS, tasks=tasks, denominator=denom, cells=cells,
+        toolchain=toolchain if toolchain is not None else _toolchain())
 
 
 # ---- planning -------------------------------------------------------
@@ -172,3 +179,49 @@ def test_cell_side_must_match_task_side() -> None:
             break
     with pytest.raises(SchemaViolationError):
         validate_payload("manifest", vp)
+
+
+# ---- dissent gap 4: the toolchain pin is REQUIRED in the signed manifest ----
+
+def test_manifest_requires_toolchain() -> None:
+    vp = _payload()
+    del vp["toolchain"]
+    with pytest.raises(SchemaViolationError):
+        validate_payload("manifest", vp)
+
+
+def test_manifest_toolchain_env_digest_must_be_sha256() -> None:
+    vp = _payload(toolchain={"python_version": "3.12", "ruff_version": "0.6",
+                             "mypy_version": "1.11", "env_digest": "not-a-digest"})
+    with pytest.raises(SchemaViolationError):
+        validate_payload("manifest", vp)
+
+
+# ---- dissent gap 5: the render gate is the CROSS-PRODUCT (planned_run_id x stage) ----
+
+def test_stage_denominator_complete_bijection() -> None:
+    vp = _payload()
+    rids = sorted(planned_run_ids(vp))
+    stages = sorted(VALID_STAGES)
+    # exactly the 4 stages for every planned cell -> complete
+    complete = [(rid, st) for rid in rids for st in stages]
+    assert_stage_denominator_complete(vp, complete)  # no raise
+    # drop one (run_id, stage) -> missing
+    with pytest.raises(DenominatorIncompleteError):
+        assert_stage_denominator_complete(vp, complete[:-1])
+    # duplicate a (run_id, stage) -> duplicate
+    with pytest.raises(DenominatorIncompleteError):
+        assert_stage_denominator_complete(vp, complete + [complete[0]])
+    # an unplanned run_id -> unplanned
+    with pytest.raises(DenominatorIncompleteError):
+        assert_stage_denominator_complete(
+            vp, complete + [("00000000-0000-4000-8000-000000000000", "gate")])
+
+
+def test_stage_denominator_rejects_four_identical_run_ids_naively() -> None:
+    # the four stage receipts share the cell's run_id; the per-cell gate would (correctly) call it a
+    # duplicate — the stage gate is the right one for cell_stage receipts.
+    vp = _payload()
+    rid = sorted(planned_run_ids(vp))[0]
+    with pytest.raises(DenominatorIncompleteError):
+        assert_denominator_complete(vp, [rid, rid, rid, rid])

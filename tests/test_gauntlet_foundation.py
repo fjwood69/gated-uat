@@ -155,22 +155,51 @@ def test_run_stage_crash_publishes_error_receipt(tmp_path: Path) -> None:
     assert "RuntimeError: stage exploded" in r.payload["observation"]["harness_error"]
 
 
-def test_stage_mutating_its_view_does_not_change_bound_digest(tmp_path: Path) -> None:
-    # dissent P1: a stage mutating its OWN fresh view cannot affect the bound (sealed) digest, and
-    # the
-    # next stage gets a fresh unmutated view — mutate->measure->restore has nothing to attack.
+def test_materialised_view_is_read_only(tmp_path: Path) -> None:
+    # dissent gap 2: the view is genuinely unwritable at the FS level — a stage that tries to write
+    # fails with an OS error (not merely "shouldn't"). The test REJECTS mutation.
+    (tmp_path / "a.py").write_text("x = 1\n")
+    with seal_artifact(tmp_path) as sealed:
+        with materialise(sealed) as view:
+            with pytest.raises(OSError):
+                (view / "injected.py").write_text("evil = 1\n")     # create in a ro dir -> refused
+            with pytest.raises(OSError):
+                (view / "a.py").write_text("tampered\n")            # overwrite a ro file -> refused
+
+
+def test_stage_write_attempt_becomes_error_receipt(tmp_path: Path) -> None:
+    # a stage that tries to mutate its view raises (ro FS) -> run_stage publishes an ERROR receipt;
+    # the bound digest is the seal's, and the next materialise is a clean, verified copy.
     s = generate_signer()
     (tmp_path / "a.py").write_text("x = 1\n")
     with seal_artifact(tmp_path) as sealed:
         def mutate(view: Path) -> StageObservation:
-            (view / "injected.py").write_text("evil = 1\n")  # mutate the ephemeral view
+            (view / "injected.py").write_text("evil = 1\n")  # refused by the ro view -> OSError
             return StageObservation("static", "pass", {
                 "tool_versions": {}, "ruff_exit": 0, "mypy_exit": 0, "findings_count": 0})
         r = run_stage(_cell(), sealed, sealed.digest, "static", mutate, s.signing_key)
-        assert r.payload["artifact_tree_digest"] == sealed.digest  # bound to the seal, not the view
-        with materialise(sealed) as view2:                          # the next view is clean
+        assert r.payload["outcome"] == "error"
+        assert r.payload["artifact_tree_digest"] == sealed.digest
+        with materialise(sealed) as view2:
             assert not (view2 / "injected.py").exists()
             assert tree_hash(view2) == sealed.digest
+
+
+def test_fifo_artifact_does_not_hang_and_publishes_errors(tmp_path: Path) -> None:
+    # dissent gap 1 (THE catch): a FIFO is rejected by the lstat preflight BEFORE _hash_file can
+    # block on open() — the pipeline returns 4 ERROR receipts, it does not hang.
+    import os
+    s = generate_signer()
+    (tmp_path / "a.py").write_text("x = 1\n")
+    os.mkfifo(tmp_path / "pipe")  # a blocking special file
+
+    def never(_v: Path) -> StageObservation:
+        raise AssertionError("stage ran despite a FIFO artifact")
+
+    receipts = run_gauntlet(_cell(), tmp_path, {s2: never for s2 in GAUNTLET_STAGES}, s.signing_key)
+    assert [r.payload["stage"] for r in receipts] == list(GAUNTLET_STAGES)
+    assert all(r.payload["outcome"] == "error" for r in receipts)
+    assert all("cell_failure" in r.payload["observation"]["harness_error"] for r in receipts)
 
 
 # ---- safe-tree policy (P1 hardening): symlinks AND hardlinks ----

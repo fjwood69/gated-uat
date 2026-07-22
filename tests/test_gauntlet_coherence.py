@@ -102,6 +102,20 @@ def test_gate_outcome_incoherent_with_result_kind_rejected() -> None:
                   "gate_outcome": "block_gate", "measured_tree_digest": _TREE})
 
 
+def test_non_run_disposition_binds_gate_outcome() -> None:
+    # gap 3: the disposition (result_reason) FIXES block vs neutral — no loose pairing.
+    def go(reason: str, gate_outcome: str) -> None:
+        _receipt("gate", "error",
+                 {"result_kind": "non_run", "result_reason": reason, "result_sub_reason": "",
+                  "gate_outcome": gate_outcome, "measured_tree_digest": _TREE})
+    go("block_action_required", "block_gate")   # coherent
+    go("skip_neutral", "neutral_gate")           # coherent
+    with pytest.raises(SchemaViolationError):     # block_action_required cannot be neutral_gate
+        go("block_action_required", "neutral_gate")
+    with pytest.raises(SchemaViolationError):     # skip_neutral cannot be block_gate
+        go("skip_neutral", "block_gate")
+
+
 # ---- CELL-LEVEL FAILURE PATH: an unsafe cell still publishes every stage ----
 
 def test_unsafe_tree_publishes_error_for_every_stage(tmp_path: Path) -> None:

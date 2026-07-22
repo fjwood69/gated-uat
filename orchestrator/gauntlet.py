@@ -65,6 +65,10 @@ from .schemas import (
 CELL_STAGE_KIND = "cell_stage"
 # The ratified ordered gauntlet (build order == run order).
 GAUNTLET_STAGES: tuple[str, ...] = ("static", "own_tests", "llm_review", "gate")
+# Reserved sentinel digest bound on a cell-level ERROR receipt when the artifact could NOT be safely
+# materialised or hashed (unsafe tree / FIFO / missing / unreadable) — sha256 of all-zeros
+# is cryptographically impossible, so it can never collide with a real tree_hash.
+UNMEASURABLE_DIGEST = "sha256:" + "0" * 64
 
 
 class DigestMismatchError(RuntimeError):
@@ -221,22 +225,41 @@ def verify_tree(tree: Path, expected_digest: str) -> None:
             f"artifact_tree_digest mismatch: expected {expected_digest!r}, tree is {actual!r}")
 
 
+def _chmod_tree(root: Path, *, writable: bool) -> None:
+    """Recursively set every entry read-only (dirs 0o555, files 0o444) or restore write (dirs 0o755,
+    files 0o644). Owner-chmod succeeds regardless of a parent dir's write bit; restore precedes the
+    rmtree so a read-only view can be purged."""
+    for p in (root, *root.rglob("*")):
+        try:
+            if writable:
+                p.chmod(0o755 if p.is_dir() else 0o644)
+            else:
+                p.chmod(0o555 if p.is_dir() else 0o444)
+        except OSError:
+            pass
+
+
 @contextmanager
 def materialise(sealed: SealedArtifact) -> Iterator[Path]:
-    """Materialise a FRESH, ephemeral view of the sealed artifact for ONE stage, verified on
-    extraction, discarded after. Extraction uses the gate's own trusted ``safe_extract_tarball``
-    (the
-    SAME path the gate trusts) so every stage's tree canonicalises identically. The digest is
-    verified == the seal BEFORE the stage runs (dissent P1: the before/after guard is now honest
-    operator-error defence — there is no shared mutable tree to attack). Nothing persists across
-    stages, so a stage mutating its own view cannot affect the bound digest or the next stage."""
+    """Materialise a FRESH, ephemeral, READ-ONLY view of the sealed artifact for ONE stage.
+
+    Extraction uses the gate's own trusted ``safe_extract_tarball`` (so every stage canonicalises
+    identically), then the view is verified == the seal (BEFORE), chmod'd unwritable at
+    the filesystem level, yielded, and re-verified == the seal (AFTER) — the after-check is the
+    cryptographic PROOF the read-only constraint held during the stage (dissent gap 2), not mere
+    defence-in-depth. A stage that tries to write its view fails with an OS error; a stage that
+    somehow mutated it fails the after-check -> a published ERROR receipt. (own_tests gets the
+    STRONGER form — a ``:ro`` bind mount inside the OCISandbox.)"""
     from gate.artifact import safe_extract_tarball
     view = Path(tempfile.mkdtemp(prefix="gauntlet-view-"))
     try:
         safe_extract_tarball(sealed.archive, view)
-        verify_tree(view, sealed.digest)  # the materialised view IS the sealed bytes, or we refuse
+        verify_tree(view, sealed.digest)   # BEFORE: the view IS the sealed bytes, or we refuse
+        _chmod_tree(view, writable=False)  # genuinely read-only at the FS level
         yield view
+        verify_tree(view, sealed.digest)   # AFTER: proof the read-only constraint held this stage
     finally:
+        _chmod_tree(view, writable=True)   # restore write so the view can be purged
         shutil.rmtree(view, ignore_errors=True)
 
 
@@ -332,18 +355,20 @@ def run_gauntlet(
     missing = [s for s in GAUNTLET_STAGES if s not in stage_fns]
     if missing:
         raise ValueError(f"stage_fns missing required stage(s): {missing}")
-    # Compute the bound digest FIRST (works for any EXISTING tree, incl an unsafe one) so a
-    # cell-level
-    # failure still binds it. A genuinely absent artifact is caller misuse, not a publishable
-    # failure.
-    digest = tree_hash(artifact_dir)
+    # The preflight (assert_safe, lstat-only — no open) + the hash both live INSIDE the failure
+    # perimeter, and safety is asserted BEFORE any hash: a FIFO / device is rejected by lstat before
+    # ``_hash_file`` can block on it (the hang), a missing/unreadable path raises IO, and an
+    # unsafe tree raises — ALL of which publish four ERROR receipts (bound to the UNMEASURABLE
+    # sentinel, since the tree could not be safely hashed), so no cell vanishes from the denominator
+    # by raising OR by hanging. ``seal_artifact`` asserts-then-hashes in that safe order.
     try:
         with seal_artifact(artifact_dir) as sealed:
-            return [run_stage(cell, sealed, digest, s, stage_fns[s], signing_key)
+            return [run_stage(cell, sealed, sealed.digest, s, stage_fns[s], signing_key)
                     for s in GAUNTLET_STAGES]
-    except (UnsafeArtifactError, SealError) as exc:
-        return [_error_receipt(cell, s, digest, f"cell_failure: {type(exc).__name__}: {exc}",
-                               signing_key) for s in GAUNTLET_STAGES]
+    except (UnsafeArtifactError, SealError, OSError) as exc:
+        return [_error_receipt(cell, s, UNMEASURABLE_DIGEST,
+                               f"cell_failure: {type(exc).__name__}: {exc}", signing_key)
+                for s in GAUNTLET_STAGES]
 
 
 # ------------------------------------------------------------------
