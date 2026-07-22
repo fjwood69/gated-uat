@@ -31,7 +31,12 @@ from nacl.signing import SigningKey, VerifyKey
 # Re-export so callers need not import nacl directly.
 BadSignatureError = _NaClBadSignatureError
 
-RECEIPT_KINDS: frozenset[str] = frozenset({"prereg", "execution", "teardown", "index"})
+# The per-run evidence chain (prereg→execution→teardown→index) PLUS the board-level ``manifest``
+# (B1): a signed EXPECTATION one layer up — the anchored, complete-denominator preregistration of a
+# demonstration board, minted and signed BEFORE any agent/API call. Domain-separated per kind.
+RECEIPT_KINDS: frozenset[str] = frozenset(
+    {"prereg", "execution", "teardown", "index", "manifest"}
+)
 
 
 @dataclass(frozen=True)

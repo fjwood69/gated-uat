@@ -62,6 +62,12 @@ VALID_SCENARIOS: frozenset[str] = frozenset(s.value for s in ScenarioId)
 SIGNER_ROLE = "EvidenceSigner"
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_UUID4_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+# B1 board sides — a tempting-task row (target: gauntlet-green, gate-BLOCKED) and its preregistered
+# clean-counterpart (target: green across all stages). Two-sidedness is a build requirement (§1).
+VALID_SIDES: frozenset[str] = frozenset({"tempting", "clean"})
 # ``sha256:<hex64>`` content-address form (gated's core.tree_hash + OCI image-config id) — distinct
 # from a bare 64-hex digest; the prefix is part of the value gated produces and must be preserved.
 _SHA256_PREFIXED_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -293,6 +299,58 @@ _INDEX_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# --- B1 board manifest (the anchored, complete-denominator board preregistration) ----------------
+# The manifest is the board's SIGNED EXPECTATION, minted before any agent/API call. Amendment 1:
+# it hash-anchors the whole board (its digest is referenced by every downstream cell receipt).
+# Amendment 2: ``cells`` is the COMPLETE ORDERED denominator — the exact planned run_id set, not
+# merely N; the render gate (manifest.py) requires exactly one terminal receipt per planned cell.
+_MANIFEST_KEYS: frozenset[str] = frozenset(
+    {
+        "schema_version",
+        "manifest_version",
+        "gated_commit",
+        "code_sha",           # package-byte digest of the harness (labelled non-authz identity)
+        "corpus_version",
+        "preregistered_at",   # descriptive only (order = the hash-anchor, not this)
+        "tasks",              # task specs (prompt+hash, invariant, gauntlet, side)
+        "denominator",        # n_replicates, seed, temperature, params, retry, infra
+        "cells",              # the COMPLETE ORDERED list of planned cells (the denominator)
+    }
+)
+_TASK_KEYS: frozenset[str] = frozenset(
+    {
+        "task_id",
+        "prompt",             # verbatim, as given to producers (anti-entrapment: published)
+        "prompt_hash",        # hex64 digest of the exact prompt bytes
+        "side",               # tempting | clean
+        "counterpart_task_id",  # the clean-counterpart task_id (points back)
+        "detector_id",        # the invariant enforced at the gate
+        "invariant_corpus_version",  # the calibrated corpus version that judges it
+        "review_prompt_hash",  # hex64 of the fixed, published LLM-review prompt
+    }
+)
+_DENOMINATOR_KEYS: frozenset[str] = frozenset(
+    {
+        "n_replicates",       # runs per (task, lineage) — declared upfront
+        "seed",
+        "temperature",
+        "params",             # dict of any additional generation params (frozen at manifest time)
+        "retry_policy",       # must be "none" (no silent reruns; a fail = ERROR row)
+        "infra_failure_disposition",  # must be "error_and_publish" (amendment: infra-fail is a row)
+    }
+)
+_CELL_KEYS: frozenset[str] = frozenset(
+    {
+        "cell_id",            # stable deterministic id (task_id/lineage/replicate)
+        "task_id",
+        "lineage",            # producing model/agent lineage (DISCLOSURE, never a ranking)
+        "side",               # tempting | clean (== the task's side)
+        "replicate",          # 0..n_replicates-1 within (task, lineage)
+        "planned_run_id",     # UUID4 minted at manifest time; every cell receipt references it
+        "reviewer_lineage",   # the deterministically-assigned reviewer; MUST differ from lineage
+    }
+)
+
 
 class SchemaViolationError(ValueError):
     """Payload fails schema requirements for its receipt kind."""
@@ -325,6 +383,13 @@ def _require_hex64(payload: dict[str, Any], key: str) -> str:
     value = _require(payload, key, types=(str,))
     if not _HEX64_RE.match(value):
         raise SchemaViolationError(f"Field {key!r}: must be 64 lowercase hex chars, got {value!r}")
+    return str(value)
+
+
+def _require_uuid4(payload: dict[str, Any], key: str) -> str:
+    value = _require(payload, key, types=(str,))
+    if not _UUID4_RE.match(value):
+        raise SchemaViolationError(f"Field {key!r}: must be a canonical UUID4, got {value!r}")
     return str(value)
 
 
@@ -818,6 +883,150 @@ def validate_index_payload(payload: dict[str, Any]) -> None:
 
 
 # ------------------------------------------------------------------
+# B1 board manifest — the anchored, complete-denominator board preregistration
+# ------------------------------------------------------------------
+
+
+def _validate_task(task: dict[str, Any], idx: int) -> None:
+    _check_exact_keys(task, _TASK_KEYS, f"tasks[{idx}]")
+    if not _require(task, "task_id", types=(str,)):
+        raise SchemaViolationError(f"tasks[{idx}].task_id: must be non-empty")
+    if not _require(task, "prompt", types=(str,)):
+        raise SchemaViolationError(f"tasks[{idx}].prompt: must be non-empty (published verbatim)")
+    _require_hex64(task, "prompt_hash")
+    _require_hex64(task, "review_prompt_hash")
+    side = _require(task, "side", types=(str,))
+    if side not in VALID_SIDES:
+        raise SchemaViolationError(f"tasks[{idx}].side: must be one of {sorted(VALID_SIDES)}")
+    for _f in ("counterpart_task_id", "detector_id", "invariant_corpus_version"):
+        if not _require(task, _f, types=(str,)):
+            raise SchemaViolationError(f"tasks[{idx}].{_f}: must be non-empty")
+
+
+def _validate_denominator(denom: dict[str, Any]) -> int:
+    """Amendment 2 + Q4: the whole denominator is committed. retry_policy MUST be 'none' (no silent
+    reruns) and infra_failure_disposition MUST be 'error_and_publish' (an infra-failed run is an
+    ERROR row, never dropped) — so cherry-picking is unrepresentable by construction. Returns
+    n_replicates."""
+    _check_exact_keys(denom, _DENOMINATOR_KEYS, "denominator")
+    n = _require(denom, "n_replicates", types=(int,))
+    if n < 1:
+        raise SchemaViolationError("denominator.n_replicates: must be >= 1")
+    _require(denom, "seed", types=(int,))
+    # temperature is an exact preregistered value carried as a STRING — gated's canonical_digest
+    # rejects floats (ambiguous representation), and the exact generation temperature must sign
+    # identically every time. params values must likewise be canonical (str/int/bool/null); a float
+    # there fails closed at mint.
+    if not _require(denom, "temperature", types=(str,)):
+        raise SchemaViolationError(
+            "denominator.temperature: must be a non-empty string (exact value)")
+    _require(denom, "params", types=(dict,))
+    retry = _require(denom, "retry_policy", types=(str,))
+    if retry != "none":
+        raise SchemaViolationError(
+            "denominator.retry_policy: must be 'none' — a silent rerun is a cherry-pick vector; a "
+            "failed run is published as an ERROR row (amendment: complete ordered denominator)")
+    disp = _require(denom, "infra_failure_disposition", types=(str,))
+    if disp != "error_and_publish":
+        raise SchemaViolationError(
+            "denominator.infra_failure_disposition: must be 'error_and_publish' — an infra failure "
+            "is an ERROR row on the board, never dropped or rerun (the gate's UNATTESTABLE reflex)")
+    return int(n)
+
+
+def validate_manifest_payload(payload: dict[str, Any]) -> None:
+    """Validate a B1 board-manifest receipt payload — the anchored, complete-denominator board
+    preregistration. Integrity checks that make the ratified amendments true-by-construction:
+      * COMPLETE ORDERED DENOMINATOR (amendment 2): ``cells`` enumerates, for every (task, lineage)
+        present, EXACTLY replicates 0..n-1 — no omission, no duplicate; every planned_run_id and
+        cell_id is unique board-wide. The render gate (manifest.py) then requires exactly one
+        terminal receipt per planned_run_id, so a cherry-picked board cannot render.
+      * REVIEWER INDEPENDENCE (§4.1, checkable from the receipt alone): every cell's
+        reviewer_lineage != its producing lineage.
+      * every cell references a DECLARED task, and its side matches that task's side.
+    Timestamps are descriptive; order is proven by the hash-anchor, not preregistered_at.
+    """
+    _check_exact_keys(payload, _MANIFEST_KEYS, "manifest")
+    _validate_schema_version(payload, 1)
+    mv = _require(payload, "manifest_version", types=(int,))
+    if mv != 1:
+        raise SchemaViolationError(f"manifest_version: expected 1, got {mv}")
+    _validate_gated_commit(payload)
+    _require_hex64(payload, "code_sha")
+    if not _require(payload, "corpus_version", types=(str,)):
+        raise SchemaViolationError("corpus_version: must be non-empty")
+    _require_iso_timestamp(payload, "preregistered_at")
+
+    tasks = _require(payload, "tasks", types=(list,))
+    if not tasks:
+        raise SchemaViolationError("tasks: must be a non-empty list")
+    task_sides: dict[str, str] = {}
+    for i, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise SchemaViolationError(f"tasks[{i}]: must be an object")
+        _validate_task(task, i)
+        tid = str(task["task_id"])
+        if tid in task_sides:
+            raise SchemaViolationError(f"tasks: duplicate task_id {tid!r}")
+        task_sides[tid] = str(task["side"])
+
+    denom = _require(payload, "denominator", types=(dict,))
+    n_replicates = _validate_denominator(denom)
+
+    cells = _require(payload, "cells", types=(list,))
+    if not cells:
+        raise SchemaViolationError("cells: must be a non-empty list (the complete denominator)")
+    seen_cell_ids: set[str] = set()
+    seen_run_ids: set[str] = set()
+    # (task_id, lineage) -> the set of replicate indices seen (must end == {0..n-1}, no dupes)
+    group_reps: dict[tuple[str, str], set[int]] = {}
+    for i, cell in enumerate(cells):
+        if not isinstance(cell, dict):
+            raise SchemaViolationError(f"cells[{i}]: must be an object")
+        _check_exact_keys(cell, _CELL_KEYS, f"cells[{i}]")
+        cid = _require(cell, "cell_id", types=(str,))
+        if not cid or cid in seen_cell_ids:
+            raise SchemaViolationError(f"cells[{i}].cell_id: must be non-empty and board-unique")
+        seen_cell_ids.add(cid)
+        rid = _require_uuid4(cell, "planned_run_id")
+        if rid in seen_run_ids:
+            raise SchemaViolationError(f"cells[{i}].planned_run_id: duplicate {rid!r}")
+        seen_run_ids.add(rid)
+        tid = _require(cell, "task_id", types=(str,))
+        if tid not in task_sides:
+            raise SchemaViolationError(f"cells[{i}].task_id {tid!r}: not a declared task")
+        side = _require(cell, "side", types=(str,))
+        if side != task_sides[tid]:
+            raise SchemaViolationError(
+                f"cells[{i}].side {side!r} != task {tid!r} side {task_sides[tid]!r}")
+        lineage = _require(cell, "lineage", types=(str,))
+        if not lineage:
+            raise SchemaViolationError(f"cells[{i}].lineage: must be non-empty")
+        reviewer = _require(cell, "reviewer_lineage", types=(str,))
+        if not reviewer or reviewer == lineage:
+            raise SchemaViolationError(
+                f"cells[{i}].reviewer_lineage {reviewer!r}: must be non-empty and DIFFER from the "
+                f"producing lineage {lineage!r} (reviewer independence, §4.1)")
+        rep = _require(cell, "replicate", types=(int,))
+        if not (0 <= rep < n_replicates):
+            raise SchemaViolationError(
+                f"cells[{i}].replicate {rep}: must be in [0, {n_replicates})")
+        grp = (tid, lineage)
+        reps = group_reps.setdefault(grp, set())
+        if rep in reps:
+            raise SchemaViolationError(
+                f"cells: duplicate replicate {rep} for (task={tid!r}, lineage={lineage!r})")
+        reps.add(rep)
+    # COMPLETE ORDERED DENOMINATOR: every (task, lineage) group is exactly {0..n-1}, no gaps.
+    full = set(range(n_replicates))
+    for (tid, lineage), reps in group_reps.items():
+        if reps != full:
+            raise SchemaViolationError(
+                f"cells: (task={tid!r}, lineage={lineage!r}) enumerates replicates {sorted(reps)}, "
+                f"not the complete set {sorted(full)} — the denominator is incomplete")
+
+
+# ------------------------------------------------------------------
 # Enforcement admissibility helpers — the expectation-vs-observation triples (§ evidence.py)
 # ------------------------------------------------------------------
 
@@ -855,6 +1064,7 @@ _V1_VALIDATORS = {
     "execution": validate_execution_payload_v1,
     "teardown": validate_teardown_payload_v1,
     "index": validate_index_payload,
+    "manifest": validate_manifest_payload,
 }
 
 _VALIDATORS = {
@@ -862,6 +1072,7 @@ _VALIDATORS = {
     "execution": validate_execution_payload,
     "teardown": validate_teardown_payload,
     "index": validate_index_payload,
+    "manifest": validate_manifest_payload,
 }
 
 
