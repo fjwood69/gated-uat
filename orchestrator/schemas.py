@@ -351,6 +351,56 @@ _CELL_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# ------------------------------------------------------------------
+# B1 step 2 — the gauntlet cell_stage receipt (one signed OBSERVATION per stage of one cell)
+# ------------------------------------------------------------------
+
+# The ordered gauntlet stages. A cell_stage receipt's ``stage`` MUST be one of these.
+VALID_STAGES: frozenset[str] = frozenset({"static", "own_tests", "llm_review", "gate"})
+# Cell-stage outcomes. ``blocked`` is the gate's BlockingRefusal projection — the payload of a
+# demonstration row (green-green-green-BLOCKED) and is VALID ONLY on the ``gate`` stage.
+VALID_CELL_OUTCOMES: frozenset[str] = frozenset({"pass", "fail", "error", "blocked"})
+# Own-tests pytest status (derived OUT-OF-BAND from the container exit code, never producer output).
+VALID_PYTEST_STATUS: frozenset[str] = frozenset({"passed", "failed", "no_tests", "error"})
+# LLM reviewer's structured verdict (measurement, not a security boundary): strict approve → PASS.
+VALID_REVIEW_VERDICTS: frozenset[str] = frozenset({"approve", "request_changes"})
+
+_CELL_STAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "schema_version",
+        "manifest_digest",      # hex64 — the signed manifest receipt digest (the board anchor)
+        "cell_id",              # == a manifest cell_id (task_id/lineage/replicate)
+        "lineage",              # producing lineage (== manifest cell)
+        "reviewer_lineage",     # cross-lineage reviewer (== manifest cell; != lineage)
+        "side",                 # tempting | clean (== manifest cell)
+        "stage",                # one of VALID_STAGES
+        "artifact_tree_digest",  # sha256:<hex64> — the ONE digest every cell stage is bound to
+        "outcome",              # VALID_CELL_OUTCOMES ('blocked' only on the gate stage)
+        "executed_at",
+        "code_sha",             # harness identity (labelled non-authz), package-byte digest
+        "observation",          # stage-specific signed sub-record (exact keys per stage)
+    }
+)
+# Exact observation key sets, keyed by stage. The observation is what the ORCHESTRATOR observed —
+# not a producer claim: own_tests is the OUT-OF-BAND container exit code; llm_review records the
+# provider/model + raw req/resp digests of a MEASUREMENT; gate carries the digest the enforcement
+# adapter ACTUALLY measured (measured_tree_digest), which MUST equal artifact_tree_digest (P1).
+_OBS_KEYS_STATIC: frozenset[str] = frozenset(
+    {"tool_versions", "ruff_exit", "mypy_exit", "findings_count"})
+_OBS_KEYS_OWN_TESTS: frozenset[str] = frozenset(
+    {"sandbox_isolation_level", "image_digest", "container_exit_code", "pytest_status"})
+_OBS_KEYS_LLM_REVIEW: frozenset[str] = frozenset(
+    {"provider_id", "model_id", "review_prompt_hash", "request_digest", "response_digest",
+     "verdict"})
+_OBS_KEYS_GATE: frozenset[str] = frozenset(
+    {"result_kind", "result_reason", "result_sub_reason", "gate_outcome", "measured_tree_digest"})
+_OBS_KEYS_BY_STAGE: dict[str, frozenset[str]] = {
+    "static": _OBS_KEYS_STATIC,
+    "own_tests": _OBS_KEYS_OWN_TESTS,
+    "llm_review": _OBS_KEYS_LLM_REVIEW,
+    "gate": _OBS_KEYS_GATE,
+}
+
 
 class SchemaViolationError(ValueError):
     """Payload fails schema requirements for its receipt kind."""
@@ -1026,6 +1076,147 @@ def validate_manifest_payload(payload: dict[str, Any]) -> None:
                 f"not the complete set {sorted(full)} — the denominator is incomplete")
 
 
+def _validate_cell_observation(
+    stage: str, obs: dict[str, Any], artifact_tree_digest: str, outcome: str
+) -> None:
+    """Validate the stage-specific observation sub-record. The observation is what the ORCHESTRATOR
+    OBSERVED (receipt-language pin) — the out-of-band container exit code (own_tests), a measurement
+    of a reviewer (llm_review), or the gate's real projection. The GATE carries the digest the
+    enforcement adapter ACTUALLY measured; P1 (source-selection false-green) is closed here as a
+    SCHEMA LAW: ``measured_tree_digest`` MUST equal the cell's bound ``artifact_tree_digest`` or the
+    payload is unsignable — the gate cannot certify a tree it did not measure.
+
+    A harness error that prevented the stage from measuring (a digest mismatch before/after the
+    stage, or an unexpected crash) is recorded HONESTLY as a canonical ``{"harness_error": <str>}``
+    observation — permitted ONLY when ``outcome == 'error'`` (a stage never claims a measurement it
+    did not make). A stage that RAN and errored uses its normal shape with error-valued fields."""
+    if outcome == "error" and set(obs) == {"harness_error"}:
+        if not _require(obs, "harness_error", types=(str,)):
+            raise SchemaViolationError("observation.harness_error: must be non-empty")
+        return
+    _check_exact_keys(obs, _OBS_KEYS_BY_STAGE[stage], f"observation[{stage}]")
+    if stage == "static":
+        _require(obs, "tool_versions", types=(dict,))
+        _require(obs, "ruff_exit", types=(int,))
+        _require(obs, "mypy_exit", types=(int,))
+        if _require(obs, "findings_count", types=(int,)) < 0:
+            raise SchemaViolationError("observation.findings_count: must be >= 0")
+    elif stage == "own_tests":
+        level = _require(obs, "sandbox_isolation_level", types=(str,))
+        if level != "hermetic":
+            raise SchemaViolationError(
+                "observation.sandbox_isolation_level: own_tests EXECUTES untrusted producer code — "
+                f"isolation must be 'hermetic' (>= the gate's), got {level!r}")
+        _require_sha256_prefixed(obs, "image_digest")
+        # container_exit_code is the OUT-OF-BAND authoritative signal; an int, or null when the
+        # container timed out / could not launch (own_tests then reports pytest_status='error').
+        cec = obs["container_exit_code"]
+        if cec is not None and not isinstance(cec, int):
+            raise SchemaViolationError(
+                "observation.container_exit_code: must be an int or null, got "
+                f"{type(cec).__name__}")
+        status = _require(obs, "pytest_status", types=(str,))
+        if status not in VALID_PYTEST_STATUS:
+            raise SchemaViolationError(
+                f"observation.pytest_status: must be one of {sorted(VALID_PYTEST_STATUS)}")
+    elif stage == "llm_review":
+        if not _require(obs, "provider_id", types=(str,)):
+            raise SchemaViolationError("observation.provider_id: must be non-empty")
+        if not _require(obs, "model_id", types=(str,)):
+            raise SchemaViolationError("observation.model_id: must be non-empty")
+        _require_hex64(obs, "review_prompt_hash")
+        _require_hex64(obs, "request_digest")
+        _require_hex64(obs, "response_digest")
+        verdict = _require(obs, "verdict", types=(str,))
+        if verdict not in VALID_REVIEW_VERDICTS:
+            raise SchemaViolationError(
+                f"observation.verdict: must be one of {sorted(VALID_REVIEW_VERDICTS)}")
+    elif stage == "gate":
+        result_kind = _require(obs, "result_kind", types=(str,))
+        if result_kind not in VALID_RESULT_KINDS:
+            raise SchemaViolationError(
+                f"observation.result_kind: must be one of {sorted(VALID_RESULT_KINDS)}")
+        _require(obs, "result_reason", types=(str,))
+        _require(obs, "result_sub_reason", types=(str,))
+        gate_outcome = obs["gate_outcome"]  # str in set, or null for an infra row (no gate outcome)
+        if gate_outcome is not None and gate_outcome not in VALID_GATE_OUTCOMES:
+            raise SchemaViolationError(
+                f"observation.gate_outcome: must be null or one of {sorted(VALID_GATE_OUTCOMES)}")
+        measured = _require_sha256_prefixed(obs, "measured_tree_digest")
+        # ---- P1 SCHEMA LAW: the gate measured the tree the cell bound, or it cannot sign. --------
+        if measured != artifact_tree_digest:
+            raise SchemaViolationError(
+                "observation.measured_tree_digest != artifact_tree_digest: the gate evaluated a "
+                f"DIFFERENT tree ({measured!r}) than the cell bound ({artifact_tree_digest!r}) — "
+                "the source-selection false-green vector (P1). A gate receipt may certify ONLY the "
+                "tree it actually measured; refusing to sign.")
+
+
+def validate_cell_stage_payload(payload: dict[str, Any]) -> None:
+    """Validate a B1 step-2 ``cell_stage`` receipt — one signed OBSERVATION of one gauntlet stage of
+    one board cell. Laws made true-by-construction (so a malformed observation is unsignable, not
+    merely discouraged):
+      * every receipt binds the manifest anchor (``manifest_digest``) and the ONE
+        ``artifact_tree_digest`` the whole cell is verified against (carry-in 1).
+      * ``reviewer_lineage`` != ``lineage`` (reviewer independence, echoed from the manifest).
+      * ``blocked`` is a GATE-only outcome (the demonstration payload); on the gate stage the
+      outcome
+        is COHERENT with the observed ``result_kind`` (no outcome that the projection can't
+        produce).
+      * P1: a gate observation's ``measured_tree_digest`` MUST equal ``artifact_tree_digest``
+        (enforced in ``_validate_cell_observation``).
+    The cell_stage receipt does not, alone, prove ``cell_id``/run_id membership in the manifest —
+    the
+    board render (step 4) enforces the bijection planned-cells ↔ terminal receipts; here we bind the
+    anchor + the tree so that reconciliation is decidable from signed material.
+    """
+    _check_exact_keys(payload, _CELL_STAGE_KEYS, "cell_stage")
+    _validate_schema_version(payload, 1)
+    _require_hex64(payload, "manifest_digest")
+    if not _require(payload, "cell_id", types=(str,)):
+        raise SchemaViolationError("cell_id: must be non-empty")
+    lineage = _require(payload, "lineage", types=(str,))
+    if not lineage:
+        raise SchemaViolationError("lineage: must be non-empty")
+    reviewer = _require(payload, "reviewer_lineage", types=(str,))
+    if not reviewer or reviewer == lineage:
+        raise SchemaViolationError(
+            f"reviewer_lineage {reviewer!r}: must be non-empty and DIFFER from lineage {lineage!r}")
+    side = _require(payload, "side", types=(str,))
+    if side not in VALID_SIDES:
+        raise SchemaViolationError(f"side: must be one of {sorted(VALID_SIDES)}")
+    stage = _require(payload, "stage", types=(str,))
+    if stage not in VALID_STAGES:
+        raise SchemaViolationError(f"stage: must be one of {sorted(VALID_STAGES)}")
+    artifact_tree_digest = _require_sha256_prefixed(payload, "artifact_tree_digest")
+    outcome = _require(payload, "outcome", types=(str,))
+    if outcome not in VALID_CELL_OUTCOMES:
+        raise SchemaViolationError(f"outcome: must be one of {sorted(VALID_CELL_OUTCOMES)}")
+    if outcome == "blocked" and stage != "gate":
+        raise SchemaViolationError(
+            "outcome 'blocked' is valid ONLY on the gate stage (the BlockingRefusal projection)")
+    _require_iso_timestamp(payload, "executed_at")
+    _require_hex64(payload, "code_sha")
+    obs = _require(payload, "observation", types=(dict,))
+    _validate_cell_observation(stage, obs, artifact_tree_digest, outcome)
+    # gate outcome<->result_kind coherence: the outcome must be one the observed projection
+    # produces.
+    # (Skipped when the observation is a harness-error record — the gate never measured a
+    # projection.)
+    if stage == "gate" and set(obs) != {"harness_error"}:
+        rk = str(obs["result_kind"])
+        coherent = {
+            "admitted_run": {"pass", "fail"},
+            "blocking_refusal": {"blocked"},
+            "non_run": {"error"},
+            "infrastructure_failure": {"error"},
+        }[rk]
+        if outcome not in coherent:
+            raise SchemaViolationError(
+                f"gate outcome {outcome!r} is incoherent with result_kind {rk!r} "
+                f"(expected one of {sorted(coherent)}) — no honest projection produces this pair")
+
+
 # ------------------------------------------------------------------
 # Enforcement admissibility helpers — the expectation-vs-observation triples (§ evidence.py)
 # ------------------------------------------------------------------
@@ -1065,6 +1256,7 @@ _V1_VALIDATORS = {
     "teardown": validate_teardown_payload_v1,
     "index": validate_index_payload,
     "manifest": validate_manifest_payload,
+    "cell_stage": validate_cell_stage_payload,
 }
 
 _VALIDATORS = {
@@ -1073,6 +1265,7 @@ _VALIDATORS = {
     "teardown": validate_teardown_payload,
     "index": validate_index_payload,
     "manifest": validate_manifest_payload,
+    "cell_stage": validate_cell_stage_payload,
 }
 
 

@@ -34,8 +34,13 @@ BadSignatureError = _NaClBadSignatureError
 # The per-run evidence chain (prereg→execution→teardown→index) PLUS the board-level ``manifest``
 # (B1): a signed EXPECTATION one layer up — the anchored, complete-denominator preregistration of a
 # demonstration board, minted and signed BEFORE any agent/API call. Domain-separated per kind.
+# ``cell_stage`` (B1 step 2): one signed OBSERVATION per gauntlet stage of one board cell — the
+# per-cell counterpart to the manifest's per-cell EXPECTATION. Each binds the manifest anchor
+# (manifest_digest), the cell's planned_run_id (the receipt run_id), and the one
+# artifact_tree_digest
+# every stage of the cell is verified against.
 RECEIPT_KINDS: frozenset[str] = frozenset(
-    {"prereg", "execution", "teardown", "index", "manifest"}
+    {"prereg", "execution", "teardown", "index", "manifest", "cell_stage"}
 )
 
 
