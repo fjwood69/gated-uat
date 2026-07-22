@@ -62,6 +62,12 @@ VALID_SCENARIOS: frozenset[str] = frozenset(s.value for s in ScenarioId)
 SIGNER_ROLE = "EvidenceSigner"
 
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+_UUID4_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+)
+# B1 board sides — a tempting-task row (target: gauntlet-green, gate-BLOCKED) and its preregistered
+# clean-counterpart (target: green across all stages). Two-sidedness is a build requirement (§1).
+VALID_SIDES: frozenset[str] = frozenset({"tempting", "clean"})
 # ``sha256:<hex64>`` content-address form (gated's core.tree_hash + OCI image-config id) — distinct
 # from a bare 64-hex digest; the prefix is part of the value gated produces and must be preserved.
 _SHA256_PREFIXED_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -293,6 +299,169 @@ _INDEX_KEYS: frozenset[str] = frozenset(
     }
 )
 
+# --- B1 board manifest (the anchored, complete-denominator board preregistration) ----------------
+# The manifest is the board's SIGNED EXPECTATION, minted before any agent/API call. Amendment 1:
+# it hash-anchors the whole board (its digest is referenced by every downstream cell receipt).
+# Amendment 2: ``cells`` is the COMPLETE ORDERED denominator — the exact planned run_id set, not
+# merely N; the render gate (manifest.py) requires exactly one terminal receipt per planned cell.
+_MANIFEST_KEYS: frozenset[str] = frozenset(
+    {
+        "schema_version",
+        "manifest_version",
+        "gated_commit",
+        "code_sha",           # package-byte digest of the harness (labelled non-authz identity)
+        "corpus_version",
+        "preregistered_at",   # descriptive only (order = the hash-anchor, not this)
+        "tasks",              # task specs (prompt+hash, invariant, gauntlet, side)
+        "denominator",        # n_replicates, seed, temperature, params, retry, infra
+        "cells",              # the COMPLETE ORDERED list of planned cells (the denominator)
+        "toolchain",          # the SIGNED static-toolchain pin (dissent gap 4) — committed here
+    }
+)
+# The static toolchain pinned IN the signed manifest (dissent gap 4): the render + the static stage
+# enforce against THIS, so an operator can't silently swap the analyser. env_digest is, SPECIFICALLY
+# (amendment C, gap-1), the static OCI image's RESOLVED CONFIG DIGEST — the ``sha256:<{{.Id}}>`` the
+# sandbox resolves and runs (== the coordinate the enforcement side binds). static_stage ASSERTS the
+# sandbox's observed image config digest == this value, so pinning the image pins ruff + mypy
+# (subsumes per-exe digests). NB: this is an anti-drift IDENTITY (which bytes were presented), NOT a
+# runtime-behaviour assurance; the version strings are descriptive.
+_TOOLCHAIN_KEYS: frozenset[str] = frozenset(
+    {"python_version", "ruff_version", "mypy_version", "env_digest"})
+_TASK_KEYS: frozenset[str] = frozenset(
+    {
+        "task_id",
+        "prompt",             # verbatim, as given to producers (anti-entrapment: published)
+        "prompt_hash",        # hex64 digest of the exact prompt bytes
+        "side",               # tempting | clean
+        "counterpart_task_id",  # the clean-counterpart task_id (points back)
+        "detector_id",        # the invariant enforced at the gate
+        "invariant_corpus_version",  # the calibrated corpus version that judges it
+        "review_prompt_hash",  # hex64 of the fixed, published LLM-review prompt
+    }
+)
+_DENOMINATOR_KEYS: frozenset[str] = frozenset(
+    {
+        "n_replicates",       # runs per (task, lineage) — declared upfront
+        "seed",
+        "temperature",
+        "params",             # dict of any additional generation params (frozen at manifest time)
+        "retry_policy",       # must be "none" (no silent reruns; a fail = ERROR row)
+        "infra_failure_disposition",  # must be "error_and_publish" (amendment: infra-fail is a row)
+    }
+)
+_CELL_KEYS: frozenset[str] = frozenset(
+    {
+        "cell_id",            # stable deterministic id (task_id/lineage/replicate)
+        "task_id",
+        "lineage",            # producing model/agent lineage (DISCLOSURE, never a ranking)
+        "side",               # tempting | clean (== the task's side)
+        "replicate",          # 0..n_replicates-1 within (task, lineage)
+        "planned_run_id",     # UUID4 minted at manifest time; every cell receipt references it
+        "reviewer_lineage",   # the deterministically-assigned reviewer; MUST differ from lineage
+    }
+)
+
+# ------------------------------------------------------------------
+# B1 step 2 — the gauntlet cell_stage receipt (one signed OBSERVATION per stage of one cell)
+# ------------------------------------------------------------------
+
+# The ordered gauntlet stages. A cell_stage receipt's ``stage`` MUST be one of these.
+VALID_STAGES: frozenset[str] = frozenset({"static", "own_tests", "llm_review", "gate"})
+# Cell-stage outcomes. ``blocked`` is the gate's BlockingRefusal projection — the payload of a
+# demonstration row (green-green-green-BLOCKED) and is VALID ONLY on the ``gate`` stage.
+VALID_CELL_OUTCOMES: frozenset[str] = frozenset({"pass", "fail", "error", "blocked"})
+# Reserved sentinel bound on a cell-level ERROR receipt when the artifact could NOT be safely
+# materialised or hashed. All-zeros is not a mathematically impossible sha256 output — it is a
+# RESERVED value made UNREACHABLE for a normal receipt BY SCHEMA LAW (the sentinel law below forces
+# outcome=error + harness_error), never by cryptographic accident.
+UNMEASURABLE_TREE_DIGEST: str = "sha256:" + "0" * 64
+# Own-tests pytest status (derived OUT-OF-BAND from the container exit code, never producer output).
+VALID_PYTEST_STATUS: frozenset[str] = frozenset({"passed", "failed", "no_tests", "error"})
+# LLM reviewer's structured verdict (measurement, not a security boundary): strict approve → PASS.
+VALID_REVIEW_VERDICTS: frozenset[str] = frozenset({"approve", "request_changes"})
+
+# --- CANONICAL stage outcome maps (single source; orchestrator.gauntlet imports these) ------------
+# Coherence is SCHEMA LAW on EVERY stage, not just the gate — a signed receipt whose outcome does
+# not
+# match its observed measurement is unrepresentable (swept across all four producers, not one).
+# own_tests: the OUT-OF-BAND container exit code fixes the status; the status fixes the cell
+# outcome.
+PYTEST_STATUS_BY_EXIT: dict[int, str] = {0: "passed", 1: "failed", 5: "no_tests"}
+OWN_TESTS_CELL_OUTCOME: dict[str, str] = {
+    "passed": "pass", "failed": "fail", "no_tests": "error", "error": "error"}
+# gate: the cell outcome for a non-admitted kind (admitted -> its own verdict pass|fail).
+GATE_CELL_OUTCOME_BY_KIND: dict[str, str] = {
+    "blocking_refusal": "blocked", "non_run": "error", "infrastructure_failure": "error"}
+# gate: the account()-COHERENT gate_outcome per result_kind. The schema cannot import gated, so this
+# re-encodes gate.job_result.account(); tests/test_gauntlet_coherence.py binds it to the REAL
+# account() output (a parity test) so the re-encoding cannot silently drift (unbound-reader guard).
+# NB (dissent catch): a BlockingRefusal carries gate_outcome=run_verdict (a real admission verdict
+# was
+# produced), NOT block_gate.
+GATE_OUTCOME_BY_RESULT_KIND: dict[str, frozenset[str | None]] = {
+    "admitted_run": frozenset({"run_verdict"}),
+    "blocking_refusal": frozenset({"run_verdict"}),
+    "non_run": frozenset({"block_gate", "neutral_gate"}),
+    "infrastructure_failure": frozenset({None}),
+}
+# non_run binds TIGHTER than the kind: the disposition (== result_reason) FIXES the gate_outcome —
+# a non_run may not pair either way (gap 3). == gate.job_result.account() over NonRunDecision.
+NON_RUN_GATE_OUTCOME_BY_REASON: dict[str, str] = {
+    "block_action_required": "block_gate",
+    "skip_neutral": "neutral_gate",
+}
+
+
+def expected_pytest_status(container_exit_code: int | None) -> str:
+    """The pytest status the OUT-OF-BAND container exit code fixes (null -> error)."""
+    if container_exit_code is None:
+        return "error"
+    return PYTEST_STATUS_BY_EXIT.get(container_exit_code, "error")
+
+_CELL_STAGE_KEYS: frozenset[str] = frozenset(
+    {
+        "schema_version",
+        "manifest_digest",      # hex64 — the signed manifest receipt digest (the board anchor)
+        "cell_id",              # == a manifest cell_id (task_id/lineage/replicate)
+        "lineage",              # producing lineage (== manifest cell)
+        "reviewer_lineage",     # cross-lineage reviewer (== manifest cell; != lineage)
+        "side",                 # tempting | clean (== manifest cell)
+        "stage",                # one of VALID_STAGES
+        "artifact_tree_digest",  # sha256:<hex64> — the ONE digest every cell stage is bound to
+        "outcome",              # VALID_CELL_OUTCOMES ('blocked' only on the gate stage)
+        "executed_at",
+        "code_sha",             # harness identity (labelled non-authz), package-byte digest
+        "observation",          # stage-specific signed sub-record (exact keys per stage)
+    }
+)
+# Exact observation key sets, keyed by stage. The observation is what the ORCHESTRATOR observed —
+# not a producer claim: own_tests is the OUT-OF-BAND container exit code; llm_review records the
+# provider/model + raw req/resp digests of a MEASUREMENT; gate carries the digest the enforcement
+# adapter ACTUALLY measured (measured_tree_digest), which MUST equal artifact_tree_digest (P1).
+# static runs IN the hermetic sandbox (gap-1): toolchain identity is the sandbox's resolved image
+# config digest (``env_digest``, asserted == manifest env_digest, subsumes tool digests); the ONLY
+# measured signal is the out-of-band exit code (stdout is DEVNULL); ``invocation_digest`` binds WHAT
+# ran (FOLD-C) so a neutered invocation is auditable. (No tool_versions/findings_count — parsing
+# stdout would re-trust the very output the sandbox discards.)
+_OBS_KEYS_STATIC: frozenset[str] = frozenset(
+    {"env_digest", "ruff_exit", "mypy_exit", "invocation_digest"})
+_OBS_KEYS_OWN_TESTS: frozenset[str] = frozenset(
+    {"sandbox_isolation_level", "image_digest", "container_exit_code", "pytest_status",
+     "invocation_digest"})
+# llm_review binds ``source_digest`` (the canonical sealed-source bytes, reconstructable to
+# artifact_tree_digest — FOLD-B) in addition to the raw request/response digests.
+_OBS_KEYS_LLM_REVIEW: frozenset[str] = frozenset(
+    {"provider_id", "model_id", "review_prompt_hash", "source_digest", "request_digest",
+     "response_digest", "verdict"})
+_OBS_KEYS_GATE: frozenset[str] = frozenset(
+    {"result_kind", "result_reason", "result_sub_reason", "gate_outcome", "measured_tree_digest"})
+_OBS_KEYS_BY_STAGE: dict[str, frozenset[str]] = {
+    "static": _OBS_KEYS_STATIC,
+    "own_tests": _OBS_KEYS_OWN_TESTS,
+    "llm_review": _OBS_KEYS_LLM_REVIEW,
+    "gate": _OBS_KEYS_GATE,
+}
+
 
 class SchemaViolationError(ValueError):
     """Payload fails schema requirements for its receipt kind."""
@@ -325,6 +494,13 @@ def _require_hex64(payload: dict[str, Any], key: str) -> str:
     value = _require(payload, key, types=(str,))
     if not _HEX64_RE.match(value):
         raise SchemaViolationError(f"Field {key!r}: must be 64 lowercase hex chars, got {value!r}")
+    return str(value)
+
+
+def _require_uuid4(payload: dict[str, Any], key: str) -> str:
+    value = _require(payload, key, types=(str,))
+    if not _UUID4_RE.match(value):
+        raise SchemaViolationError(f"Field {key!r}: must be a canonical UUID4, got {value!r}")
     return str(value)
 
 
@@ -818,6 +994,370 @@ def validate_index_payload(payload: dict[str, Any]) -> None:
 
 
 # ------------------------------------------------------------------
+# B1 board manifest — the anchored, complete-denominator board preregistration
+# ------------------------------------------------------------------
+
+
+def _validate_task(task: dict[str, Any], idx: int) -> None:
+    _check_exact_keys(task, _TASK_KEYS, f"tasks[{idx}]")
+    if not _require(task, "task_id", types=(str,)):
+        raise SchemaViolationError(f"tasks[{idx}].task_id: must be non-empty")
+    if not _require(task, "prompt", types=(str,)):
+        raise SchemaViolationError(f"tasks[{idx}].prompt: must be non-empty (published verbatim)")
+    _require_hex64(task, "prompt_hash")
+    _require_hex64(task, "review_prompt_hash")
+    side = _require(task, "side", types=(str,))
+    if side not in VALID_SIDES:
+        raise SchemaViolationError(f"tasks[{idx}].side: must be one of {sorted(VALID_SIDES)}")
+    for _f in ("counterpart_task_id", "detector_id", "invariant_corpus_version"):
+        if not _require(task, _f, types=(str,)):
+            raise SchemaViolationError(f"tasks[{idx}].{_f}: must be non-empty")
+
+
+def _validate_denominator(denom: dict[str, Any]) -> int:
+    """Amendment 2 + Q4: the whole denominator is committed. retry_policy MUST be 'none' (no silent
+    reruns) and infra_failure_disposition MUST be 'error_and_publish' (an infra-failed run is an
+    ERROR row, never dropped) — so cherry-picking is unrepresentable by construction. Returns
+    n_replicates."""
+    _check_exact_keys(denom, _DENOMINATOR_KEYS, "denominator")
+    n = _require(denom, "n_replicates", types=(int,))
+    if n < 1:
+        raise SchemaViolationError("denominator.n_replicates: must be >= 1")
+    _require(denom, "seed", types=(int,))
+    # temperature is an exact preregistered value carried as a STRING — gated's canonical_digest
+    # rejects floats (ambiguous representation), and the exact generation temperature must sign
+    # identically every time. params values must likewise be canonical (str/int/bool/null); a float
+    # there fails closed at mint.
+    if not _require(denom, "temperature", types=(str,)):
+        raise SchemaViolationError(
+            "denominator.temperature: must be a non-empty string (exact value)")
+    _require(denom, "params", types=(dict,))
+    retry = _require(denom, "retry_policy", types=(str,))
+    if retry != "none":
+        raise SchemaViolationError(
+            "denominator.retry_policy: must be 'none' — a silent rerun is a cherry-pick vector; a "
+            "failed run is published as an ERROR row (amendment: complete ordered denominator)")
+    disp = _require(denom, "infra_failure_disposition", types=(str,))
+    if disp != "error_and_publish":
+        raise SchemaViolationError(
+            "denominator.infra_failure_disposition: must be 'error_and_publish' — an infra failure "
+            "is an ERROR row on the board, never dropped or rerun (the gate's UNATTESTABLE reflex)")
+    return int(n)
+
+
+def _validate_toolchain(tc: dict[str, Any]) -> None:
+    """The signed static-toolchain pin (dissent gap 4). env_digest is the AUTHORITATIVE coordinate
+    (dependency-lock digest or pinned OCI image id, ``sha256:<hex64>``); the version strings are
+    descriptive. Committed in the manifest so the static stage + the render enforce against it."""
+    _check_exact_keys(tc, _TOOLCHAIN_KEYS, "toolchain")
+    for k in ("python_version", "ruff_version", "mypy_version"):
+        if not _require(tc, k, types=(str,)):
+            raise SchemaViolationError(f"toolchain.{k}: must be non-empty")
+    _require_sha256_prefixed(tc, "env_digest")
+
+
+def validate_manifest_payload(payload: dict[str, Any]) -> None:
+    """Validate a B1 board-manifest receipt payload — the anchored, complete-denominator board
+    preregistration. Integrity checks that make the ratified amendments true-by-construction:
+      * COMPLETE ORDERED DENOMINATOR (amendment 2): ``cells`` enumerates, for every (task, lineage)
+        present, EXACTLY replicates 0..n-1 — no omission, no duplicate; every planned_run_id and
+        cell_id is unique board-wide. The render gate (manifest.py) then requires exactly one
+        terminal receipt per planned_run_id, so a cherry-picked board cannot render.
+      * REVIEWER INDEPENDENCE (§4.1, checkable from the receipt alone): every cell's
+        reviewer_lineage != its producing lineage.
+      * every cell references a DECLARED task, and its side matches that task's side.
+    Timestamps are descriptive; order is proven by the hash-anchor, not preregistered_at.
+    """
+    _check_exact_keys(payload, _MANIFEST_KEYS, "manifest")
+    _validate_schema_version(payload, 1)
+    mv = _require(payload, "manifest_version", types=(int,))
+    if mv != 1:
+        raise SchemaViolationError(f"manifest_version: expected 1, got {mv}")
+    _validate_gated_commit(payload)
+    _require_hex64(payload, "code_sha")
+    if not _require(payload, "corpus_version", types=(str,)):
+        raise SchemaViolationError("corpus_version: must be non-empty")
+    _require_iso_timestamp(payload, "preregistered_at")
+
+    tasks = _require(payload, "tasks", types=(list,))
+    if not tasks:
+        raise SchemaViolationError("tasks: must be a non-empty list")
+    task_sides: dict[str, str] = {}
+    for i, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise SchemaViolationError(f"tasks[{i}]: must be an object")
+        _validate_task(task, i)
+        tid = str(task["task_id"])
+        if tid in task_sides:
+            raise SchemaViolationError(f"tasks: duplicate task_id {tid!r}")
+        task_sides[tid] = str(task["side"])
+
+    denom = _require(payload, "denominator", types=(dict,))
+    n_replicates = _validate_denominator(denom)
+
+    _validate_toolchain(_require(payload, "toolchain", types=(dict,)))
+
+    cells = _require(payload, "cells", types=(list,))
+    if not cells:
+        raise SchemaViolationError("cells: must be a non-empty list (the complete denominator)")
+    seen_cell_ids: set[str] = set()
+    seen_run_ids: set[str] = set()
+    # (task_id, lineage) -> the set of replicate indices seen (must end == {0..n-1}, no dupes)
+    group_reps: dict[tuple[str, str], set[int]] = {}
+    for i, cell in enumerate(cells):
+        if not isinstance(cell, dict):
+            raise SchemaViolationError(f"cells[{i}]: must be an object")
+        _check_exact_keys(cell, _CELL_KEYS, f"cells[{i}]")
+        cid = _require(cell, "cell_id", types=(str,))
+        if not cid or cid in seen_cell_ids:
+            raise SchemaViolationError(f"cells[{i}].cell_id: must be non-empty and board-unique")
+        seen_cell_ids.add(cid)
+        rid = _require_uuid4(cell, "planned_run_id")
+        if rid in seen_run_ids:
+            raise SchemaViolationError(f"cells[{i}].planned_run_id: duplicate {rid!r}")
+        seen_run_ids.add(rid)
+        tid = _require(cell, "task_id", types=(str,))
+        if tid not in task_sides:
+            raise SchemaViolationError(f"cells[{i}].task_id {tid!r}: not a declared task")
+        side = _require(cell, "side", types=(str,))
+        if side != task_sides[tid]:
+            raise SchemaViolationError(
+                f"cells[{i}].side {side!r} != task {tid!r} side {task_sides[tid]!r}")
+        lineage = _require(cell, "lineage", types=(str,))
+        if not lineage:
+            raise SchemaViolationError(f"cells[{i}].lineage: must be non-empty")
+        reviewer = _require(cell, "reviewer_lineage", types=(str,))
+        if not reviewer or reviewer == lineage:
+            raise SchemaViolationError(
+                f"cells[{i}].reviewer_lineage {reviewer!r}: must be non-empty and DIFFER from the "
+                f"producing lineage {lineage!r} (reviewer independence, §4.1)")
+        rep = _require(cell, "replicate", types=(int,))
+        if not (0 <= rep < n_replicates):
+            raise SchemaViolationError(
+                f"cells[{i}].replicate {rep}: must be in [0, {n_replicates})")
+        grp = (tid, lineage)
+        reps = group_reps.setdefault(grp, set())
+        if rep in reps:
+            raise SchemaViolationError(
+                f"cells: duplicate replicate {rep} for (task={tid!r}, lineage={lineage!r})")
+        reps.add(rep)
+    # COMPLETE ORDERED DENOMINATOR: every (task, lineage) group is exactly {0..n-1}, no gaps.
+    full = set(range(n_replicates))
+    for (tid, lineage), reps in group_reps.items():
+        if reps != full:
+            raise SchemaViolationError(
+                f"cells: (task={tid!r}, lineage={lineage!r}) enumerates replicates {sorted(reps)}, "
+                f"not the complete set {sorted(full)} — the denominator is incomplete")
+
+
+def _validate_cell_observation(
+    stage: str, obs: dict[str, Any], artifact_tree_digest: str, outcome: str
+) -> None:
+    """Validate the stage-specific observation sub-record. The observation is what the ORCHESTRATOR
+    OBSERVED (receipt-language pin) — the out-of-band container exit code (own_tests), a measurement
+    of a reviewer (llm_review), or the gate's real projection. The GATE carries the digest the
+    enforcement adapter ACTUALLY measured; P1 (source-selection false-green) is closed here as a
+    SCHEMA LAW: ``measured_tree_digest`` MUST equal the cell's bound ``artifact_tree_digest`` or the
+    payload is unsignable — the gate cannot certify a tree it did not measure.
+
+    A harness error that prevented the stage from measuring (a digest mismatch before/after the
+    stage, or an unexpected crash) is recorded HONESTLY as a canonical ``{"harness_error": <str>}``
+    observation — permitted ONLY when ``outcome == 'error'`` (a stage never claims a measurement it
+    did not make). A stage that RAN and errored uses its normal shape with error-valued fields."""
+    if outcome == "error" and set(obs) == {"harness_error"}:
+        if not _require(obs, "harness_error", types=(str,)):
+            raise SchemaViolationError("observation.harness_error: must be non-empty")
+        return
+    _check_exact_keys(obs, _OBS_KEYS_BY_STAGE[stage], f"observation[{stage}]")
+    if stage == "static":
+        # env_digest == the sandbox's resolved image config digest (asserted == manifest env_digest
+        # in static_stage); invocation_digest binds WHAT ran (FOLD-C). The measured signal is the
+        # out-of-band exit codes only.
+        _require_sha256_prefixed(obs, "env_digest")
+        ruff_exit = _require(obs, "ruff_exit", types=(int,))
+        mypy_exit = _require(obs, "mypy_exit", types=(int,))
+        _require_hex64(obs, "invocation_digest")
+        # COHERENCE LAW: a measured static run is pass iff BOTH tools exited 0 (else fail); an error
+        # is only ever the harness_error path above.
+        if outcome not in ("pass", "fail"):
+            raise SchemaViolationError(
+                f"static outcome must be pass|fail (measured), got {outcome!r}")
+        expected = "pass" if (ruff_exit == 0 and mypy_exit == 0) else "fail"
+        if outcome != expected:
+            raise SchemaViolationError(
+                f"static outcome {outcome!r} incoherent with exits (ruff={ruff_exit}, "
+                f"mypy={mypy_exit}) — must be {expected!r} (a non-zero exit cannot sign 'pass')")
+    elif stage == "own_tests":
+        level = _require(obs, "sandbox_isolation_level", types=(str,))
+        if level != "hermetic":
+            raise SchemaViolationError(
+                "observation.sandbox_isolation_level: own_tests EXECUTES untrusted producer code — "
+                f"isolation must be 'hermetic' (>= the gate's), got {level!r}")
+        _require_sha256_prefixed(obs, "image_digest")
+        # container_exit_code is the OUT-OF-BAND authoritative signal; an int, or null when the
+        # container timed out / could not launch (own_tests then reports pytest_status='error').
+        cec = obs["container_exit_code"]
+        if cec is not None and not isinstance(cec, int):
+            raise SchemaViolationError(
+                "observation.container_exit_code: must be an int or null, got "
+                f"{type(cec).__name__}")
+        _require_hex64(obs, "invocation_digest")   # FOLD-C: WHAT ran is auditable
+        status = _require(obs, "pytest_status", types=(str,))
+        if status not in VALID_PYTEST_STATUS:
+            raise SchemaViolationError(
+                f"observation.pytest_status: must be one of {sorted(VALID_PYTEST_STATUS)}")
+        # COHERENCE LAW: the exit code fixes the status, the status fixes the outcome — a receipt
+        # with
+        # exit_code=1/pytest_status=passed (or status/outcome disagreeing) is unrepresentable.
+        want_status = expected_pytest_status(cec)
+        if status != want_status:
+            raise SchemaViolationError(
+                f"pytest_status {status!r} incoherent with container_exit_code {cec!r} "
+                f"(the out-of-band exit fixes status={want_status!r})")
+        if outcome != OWN_TESTS_CELL_OUTCOME[status]:
+            raise SchemaViolationError(
+                f"own_tests outcome {outcome!r} incoherent with pytest_status {status!r} "
+                f"(must be {OWN_TESTS_CELL_OUTCOME[status]!r})")
+    elif stage == "llm_review":
+        if not _require(obs, "provider_id", types=(str,)):
+            raise SchemaViolationError("observation.provider_id: must be non-empty")
+        if not _require(obs, "model_id", types=(str,)):
+            raise SchemaViolationError("observation.model_id: must be non-empty")
+        _require_hex64(obs, "review_prompt_hash")
+        # FOLD-B: source_digest = sha256 of the canonical sealed-source bytes in the request;
+        # reconstructable to artifact_tree_digest (per-file sha256 + raw relpaths). The claim is
+        # harness-BUILT-a-request-embedding-the-source, NOT client-transmitted / model-saw-only.
+        _require_hex64(obs, "source_digest")
+        _require_hex64(obs, "request_digest")
+        _require_hex64(obs, "response_digest")
+        verdict = _require(obs, "verdict", types=(str,))
+        if verdict not in VALID_REVIEW_VERDICTS:
+            raise SchemaViolationError(
+                f"observation.verdict: must be one of {sorted(VALID_REVIEW_VERDICTS)}")
+        # COHERENCE LAW: strict approve -> pass; anything else -> fail (the reviewer 'caught' it).
+        if outcome not in ("pass", "fail"):
+            raise SchemaViolationError(
+                f"llm_review outcome must be pass|fail (measured), got {outcome!r}")
+        expected_rv = "pass" if verdict == "approve" else "fail"
+        if outcome != expected_rv:
+            raise SchemaViolationError(
+                f"llm_review outcome {outcome!r} incoherent with verdict {verdict!r} "
+                f"(strict approve->pass; must be {expected_rv!r})")
+    elif stage == "gate":
+        result_kind = _require(obs, "result_kind", types=(str,))
+        if result_kind not in VALID_RESULT_KINDS:
+            raise SchemaViolationError(
+                f"observation.result_kind: must be one of {sorted(VALID_RESULT_KINDS)}")
+        result_reason = _require(obs, "result_reason", types=(str,))
+        _require(obs, "result_sub_reason", types=(str,))
+        gate_outcome = obs["gate_outcome"]  # str in set, or null for an infra row (no gate outcome)
+        if gate_outcome is not None and gate_outcome not in VALID_GATE_OUTCOMES:
+            raise SchemaViolationError(
+                f"observation.gate_outcome: must be null or one of {sorted(VALID_GATE_OUTCOMES)}")
+        # COHERENCE LAW (== account(), parity-tested): the gate_outcome a result_kind
+        # can carry is fixed — a blocking_refusal is run_verdict (a real admission verdict), NOT
+        # block_gate; an infra row carries NO gate outcome.
+        if gate_outcome not in GATE_OUTCOME_BY_RESULT_KIND[result_kind]:
+            raise SchemaViolationError(
+                f"gate_outcome {gate_outcome!r} incoherent with result_kind {result_kind!r} "
+                "(account() permits "
+                f"{sorted(str(x) for x in GATE_OUTCOME_BY_RESULT_KIND[result_kind])})")
+        # non_run binds TIGHTER (gap 3): the disposition (result_reason) FIXES block vs neutral.
+        if result_kind == "non_run":
+            want = NON_RUN_GATE_OUTCOME_BY_REASON.get(result_reason)
+            if want is None:
+                raise SchemaViolationError(
+                    f"non_run result_reason {result_reason!r} must be one of "
+                    f"{sorted(NON_RUN_GATE_OUTCOME_BY_REASON)}")
+            if gate_outcome != want:
+                raise SchemaViolationError(
+                    f"non_run gate_outcome {gate_outcome!r} incoherent with disposition "
+                    f"{result_reason!r} — account() fixes it to {want!r}")
+        measured = _require_sha256_prefixed(obs, "measured_tree_digest")
+        # ---- P1 SCHEMA LAW: the gate measured the tree the cell bound, or it cannot sign. --------
+        if measured != artifact_tree_digest:
+            raise SchemaViolationError(
+                "observation.measured_tree_digest != artifact_tree_digest: the gate evaluated a "
+                f"DIFFERENT tree ({measured!r}) than the cell bound ({artifact_tree_digest!r}) — "
+                "the source-selection false-green vector (P1). A gate receipt may certify ONLY the "
+                "tree it actually measured; refusing to sign.")
+
+
+def validate_cell_stage_payload(payload: dict[str, Any]) -> None:
+    """Validate a B1 step-2 ``cell_stage`` receipt — one signed OBSERVATION of one gauntlet stage of
+    one board cell. Laws made true-by-construction (so a malformed observation is unsignable, not
+    merely discouraged):
+      * every receipt binds the manifest anchor (``manifest_digest``) and the ONE
+        ``artifact_tree_digest`` the whole cell is verified against (carry-in 1).
+      * ``reviewer_lineage`` != ``lineage`` (reviewer independence, echoed from the manifest).
+      * ``blocked`` is a GATE-only outcome (the demonstration payload); on the gate stage the
+      outcome
+        is COHERENT with the observed ``result_kind`` (no outcome that the projection can't
+        produce).
+      * P1: a gate observation's ``measured_tree_digest`` MUST equal ``artifact_tree_digest``
+        (enforced in ``_validate_cell_observation``).
+    The cell_stage receipt does not, alone, prove ``cell_id``/run_id membership in the manifest —
+    the
+    board render (step 4) enforces the bijection planned-cells ↔ terminal receipts; here we bind the
+    anchor + the tree so that reconciliation is decidable from signed material.
+    """
+    _check_exact_keys(payload, _CELL_STAGE_KEYS, "cell_stage")
+    _validate_schema_version(payload, 1)
+    _require_hex64(payload, "manifest_digest")
+    if not _require(payload, "cell_id", types=(str,)):
+        raise SchemaViolationError("cell_id: must be non-empty")
+    lineage = _require(payload, "lineage", types=(str,))
+    if not lineage:
+        raise SchemaViolationError("lineage: must be non-empty")
+    reviewer = _require(payload, "reviewer_lineage", types=(str,))
+    if not reviewer or reviewer == lineage:
+        raise SchemaViolationError(
+            f"reviewer_lineage {reviewer!r}: must be non-empty and DIFFER from lineage {lineage!r}")
+    side = _require(payload, "side", types=(str,))
+    if side not in VALID_SIDES:
+        raise SchemaViolationError(f"side: must be one of {sorted(VALID_SIDES)}")
+    stage = _require(payload, "stage", types=(str,))
+    if stage not in VALID_STAGES:
+        raise SchemaViolationError(f"stage: must be one of {sorted(VALID_STAGES)}")
+    artifact_tree_digest = _require_sha256_prefixed(payload, "artifact_tree_digest")
+    outcome = _require(payload, "outcome", types=(str,))
+    if outcome not in VALID_CELL_OUTCOMES:
+        raise SchemaViolationError(f"outcome: must be one of {sorted(VALID_CELL_OUTCOMES)}")
+    if outcome == "blocked" and stage != "gate":
+        raise SchemaViolationError(
+            "outcome 'blocked' is valid ONLY on the gate stage (the BlockingRefusal projection)")
+    _require_iso_timestamp(payload, "executed_at")
+    _require_hex64(payload, "code_sha")
+    obs = _require(payload, "observation", types=(dict,))
+    # SENTINEL SCHEMA LAW (dissent gap 2b): the UNMEASURABLE sentinel digest (an artifact that could
+    # not be safely materialised/hashed) is signable ONLY on a harness-error ERROR receipt — a
+    # PASS/FAIL/BLOCKED receipt binding it is a lie (it certifies a measurement of a tree that was
+    # never measured) and is UNSIGNABLE. Bound structurally, not by the caller's discipline.
+    if artifact_tree_digest == UNMEASURABLE_TREE_DIGEST:
+        if outcome != "error" or set(obs) != {"harness_error"}:
+            raise SchemaViolationError(
+                "UNMEASURABLE_TREE_DIGEST is signable ONLY with outcome='error' + a harness_error "
+                f"observation — got outcome={outcome!r}, obs keys={sorted(obs)}")
+    _validate_cell_observation(stage, obs, artifact_tree_digest, outcome)
+    # gate outcome<->result_kind coherence: the outcome must be one the observed projection
+    # produces.
+    # (Skipped when the observation is a harness-error record — the gate never measured a
+    # projection.)
+    if stage == "gate" and set(obs) != {"harness_error"}:
+        rk = str(obs["result_kind"])
+        coherent = {
+            "admitted_run": {"pass", "fail"},
+            "blocking_refusal": {"blocked"},
+            "non_run": {"error"},
+            "infrastructure_failure": {"error"},
+        }[rk]
+        if outcome not in coherent:
+            raise SchemaViolationError(
+                f"gate outcome {outcome!r} is incoherent with result_kind {rk!r} "
+                f"(expected one of {sorted(coherent)}) — no honest projection produces this pair")
+
+
+# ------------------------------------------------------------------
 # Enforcement admissibility helpers — the expectation-vs-observation triples (§ evidence.py)
 # ------------------------------------------------------------------
 
@@ -855,6 +1395,8 @@ _V1_VALIDATORS = {
     "execution": validate_execution_payload_v1,
     "teardown": validate_teardown_payload_v1,
     "index": validate_index_payload,
+    "manifest": validate_manifest_payload,
+    "cell_stage": validate_cell_stage_payload,
 }
 
 _VALIDATORS = {
@@ -862,6 +1404,8 @@ _VALIDATORS = {
     "execution": validate_execution_payload,
     "teardown": validate_teardown_payload,
     "index": validate_index_payload,
+    "manifest": validate_manifest_payload,
+    "cell_stage": validate_cell_stage_payload,
 }
 
 
