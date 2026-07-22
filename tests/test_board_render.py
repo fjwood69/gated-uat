@@ -34,6 +34,7 @@ from orchestrator.manifest import (
     CELL_STAGE_KIND,
     AnchorMismatchError,
     BoardRenderError,
+    CellIdentityMismatchError,
     DenominatorIncompleteError,
     ManifestVerificationError,
     ToolchainPinMismatchError,
@@ -349,4 +350,58 @@ def test_foreign_key_signed_cell_stage_refused() -> None:
     receipts = _full_board(s.signing_key, mr.digest, cells)
     receipts[0] = _receipt(cells[0], "static", other.signing_key, manifest_digest=mr.digest)
     with pytest.raises(BoardRenderError):
+        assert_board_admissible(mr, receipts, s.verify_key)
+
+
+# ---- B1-1: cell-identity reconciliation vs the manifest cell -----------------------------------
+
+def test_forged_cell_identity_refuses() -> None:
+    # B1-1: a validly-signed, pin-matched static receipt carrying the RIGHT planned_run_id but a
+    # FLIPPED side (tempting cell displayed as clean) is refused — a board that trusted receipt
+    # display fields would mis-attribute the result. Requires the harness key; still refused.
+    s = generate_signer()
+    pl = _manifest_payload()
+    mr = build_manifest(pl, s.signing_key)
+    cells = pl["cells"]
+    receipts = _full_board(s.signing_key, mr.digest, cells)
+    target = cells[0]
+    flipped = "clean" if target["side"] == "tempting" else "tempting"
+    forged = CellContext(
+        manifest_digest=mr.digest, planned_run_id=target["planned_run_id"],
+        cell_id=target["cell_id"], lineage=target["lineage"],
+        reviewer_lineage=target["reviewer_lineage"], side=flipped)
+    outcome, obs = _STAGE_OBS["static"]
+    for i, r in enumerate(receipts):
+        if r.run_id == target["planned_run_id"] and r.payload["stage"] == "static":
+            receipts[i] = build_cell_stage_receipt(
+                forged, "static", outcome, dict(obs), _ARTIFACT, s.signing_key)
+            break
+    with pytest.raises(CellIdentityMismatchError):
+        assert_board_admissible(mr, receipts, s.verify_key)
+
+
+def test_forged_lineage_identity_refuses() -> None:
+    # B1-1: same, flipping the producing lineage — mis-attributes which producer made the artifact.
+    # (reviewer_lineage kept != lineage so the receipt stays schema-valid.)
+    s = generate_signer()
+    pl = _manifest_payload()
+    mr = build_manifest(pl, s.signing_key)
+    cells = pl["cells"]
+    receipts = _full_board(s.signing_key, mr.digest, cells)
+    target = cells[0]
+    # a made-up producing lineage (!= the manifest cell's lineage; != reviewer so the receipt stays
+    # schema-valid). B1-1 must catch that the DISPLAYED producer disagrees with the manifest cell.
+    ghost_lineage = "ghost-lineage"
+    assert ghost_lineage not in (target["lineage"], target["reviewer_lineage"])
+    forged = CellContext(
+        manifest_digest=mr.digest, planned_run_id=target["planned_run_id"],
+        cell_id=target["cell_id"], lineage=ghost_lineage,
+        reviewer_lineage=target["reviewer_lineage"], side=target["side"])
+    outcome, obs = _STAGE_OBS["static"]
+    for i, r in enumerate(receipts):
+        if r.run_id == target["planned_run_id"] and r.payload["stage"] == "static":
+            receipts[i] = build_cell_stage_receipt(
+                forged, "static", outcome, dict(obs), _ARTIFACT, s.signing_key)
+            break
+    with pytest.raises(CellIdentityMismatchError):
         assert_board_admissible(mr, receipts, s.verify_key)

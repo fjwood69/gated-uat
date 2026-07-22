@@ -25,6 +25,7 @@ from orchestrator.evidence import (
     build_index,
     build_receipt,
     build_teardown_receipt,
+    validate_semantic_continuity,
     verify_integrity,
 )
 from orchestrator.expectations import (
@@ -463,6 +464,26 @@ class ContinuityTests(unittest.TestCase):
         with self.assertRaises(SemanticContinuityError):
             _chain(_prereg(ScenarioId.SUBJECT_DRIFT_SECOND_IMAGE),
                    _matched_exec(ScenarioId.ABA_GENERATION_MOVED))
+
+    def test_missing_plan_policy_id_fails_closed(self) -> None:
+        # UAT-1 belt: a v3 execution with the plan_policy_id KEY absent (a future schema regression)
+        # must fail continuity CLOSED — not silently .get→None and skip the plan-binding comparison
+        # (the exact bug UAT-1 closed at the schema layer; defence in depth at continuity).
+        # build_receipt_unchecked bypasses the schema (which independently rejects the omission) so
+        # the continuity gate is exercised directly.
+        sk = SigningKey.generate()
+        xp = _matched_exec(ScenarioId.COMPLIANT_ADMIT)
+        del xp["plan_policy_id"]
+        prereg = build_receipt(
+            "prereg", "11111111-1111-4111-8111-111111111111",
+            _prereg(ScenarioId.COMPLIANT_ADMIT), sk)
+        execution = build_receipt_unchecked(
+            "execution", prereg.run_id, {**xp, "prereg_digest": prereg.digest}, sk)
+        teardown = build_teardown_receipt(
+            execution, {"schema_version": 3, "profile": "p1", "failure": False,
+                        "torn_down_at": _ISO, "runtime_pack_digest": _HEX}, sk)
+        with self.assertRaises(SemanticContinuityError):
+            validate_semantic_continuity(prereg, execution, teardown)
 
 
 class TaxonomyTests(unittest.TestCase):

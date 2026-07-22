@@ -1148,6 +1148,28 @@ def validate_manifest_payload(payload: dict[str, Any]) -> None:
             raise SchemaViolationError(
                 f"cells: (task={tid!r}, lineage={lineage!r}) enumerates replicates {sorted(reps)}, "
                 f"not the complete set {sorted(full)} — the denominator is incomplete")
+    # B1-2 (task ⊆ cells + FULL task×lineage product): the loop above only completes groups that
+    # APPEAR in cells, so a manifest could DECLARE a task in ``tasks`` yet give it no cells
+    # (advertise 100 hard tasks, run 10 trivial ones) or cover tasks asymmetrically across lineages,
+    # and still sign. The denominator is complete ONLY when cells are the exact cross-product
+    # declared-tasks × lineages-in-cells (mirroring plan_cells). Enforced at MINT so a cherry-picked
+    # denominator is UNSIGNABLE, not merely unrenderable. NB (deferred B1-2b): uniform omission of a
+    # lineage that NEVER appears in cells is not detected — lineages have no declared list (only
+    # tasks do); closing that needs a schema-format ``denominator.lineages`` field.
+    declared_tasks = set(task_sides)
+    tasks_in_cells = {tid for (tid, _lin) in group_reps}
+    if tasks_in_cells != declared_tasks:
+        raise SchemaViolationError(
+            f"cells: task set {sorted(tasks_in_cells)} != declared tasks "
+            f"{sorted(declared_tasks)} — every advertised task must have cells (no orphan declared "
+            "task; complete denominator)")
+    lineages_in_cells = {lin for (_tid, lin) in group_reps}
+    product = {(t, lin) for t in declared_tasks for lin in lineages_in_cells}
+    missing_pairs = product - set(group_reps)
+    if missing_pairs:
+        raise SchemaViolationError(
+            f"cells: missing (task, lineage) pairs {sorted(missing_pairs)} — cells must be the "
+            "complete product of declared tasks × lineages-in-cells (no asymmetric coverage)")
 
 
 def _validate_cell_observation(

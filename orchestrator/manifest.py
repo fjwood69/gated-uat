@@ -294,6 +294,14 @@ class ToolchainPinMismatchError(BoardRenderError):
     analyser was (or could have been) swapped; the board MUST NOT render (dissent gap 4, Gate 3)."""
 
 
+class CellIdentityMismatchError(BoardRenderError):
+    """A PLANNED cell_stage receipt carries display identity (cell_id / side / lineage /
+    reviewer_lineage) that disagrees with the manifest cell for its ``planned_run_id`` — a valid,
+    pin-matched receipt attributed to the WRONG cell identity (B1-1 / Board P2). Forging it needs a
+    harness key, but a board that trusts receipt display fields would mis-attribute a result; refuse
+    to render. Raised ONLY for PLANNED run_ids; unplanned is the bijection's job, not this."""
+
+
 def _verify_cell_stage_receipt(receipt: Receipt, verify_key: VerifyKey) -> dict[str, Any]:
     """Verify ONE cell_stage receipt standalone: kind, digest recompute, Ed25519 signature, schema —
     the same fail-closed shape as ``verify_manifest`` / ``evidence._verify_one``. The kind check is
@@ -360,6 +368,9 @@ def assert_board_admissible(
     """
     manifest_payload = verify_manifest(manifest_receipt, verify_key)
     anchor = manifest_receipt.digest
+    # B1-1: the authoritative identity of each planned cell, keyed by planned_run_id (unique by the
+    # manifest schema — no collisions). run_id -> manifest cell.
+    by_rid = {str(c["planned_run_id"]): c for c in manifest_payload["cells"]}
 
     stage_pairs: list[tuple[str, str]] = []
     for receipt in cell_stage_receipts:
@@ -368,6 +379,18 @@ def assert_board_admissible(
             raise AnchorMismatchError(
                 f"cell_stage receipt {receipt.run_id!r}/{payload['stage']!r} is anchored to "
                 f"{payload['manifest_digest']!r}, not this board {anchor!r}")
+        # B1-1 (cell-identity reconciliation): a receipt's display identity must equal the manifest
+        # cell for its planned_run_id, or a valid pin-matched receipt could be attributed to the
+        # WRONG cell (e.g. a tempting-side artifact shown as clean-side). Only for PLANNED run_ids —
+        # an UNPLANNED run_id has no manifest cell to compare — it is the bijection's job below
+        # (Board: don't raise an identity error where the denominator gate is the right refusal).
+        expected = by_rid.get(receipt.run_id)
+        if expected is not None:
+            for _field in ("cell_id", "side", "lineage", "reviewer_lineage"):
+                if str(payload[_field]) != str(expected[_field]):
+                    raise CellIdentityMismatchError(
+                        f"cell_stage receipt {receipt.run_id!r} {_field}={payload[_field]!r} != "
+                        f"manifest cell {expected[_field]!r} — mis-attributed cell identity")
         stage_pairs.append((receipt.run_id, str(payload["stage"])))
 
     # exact bijection FIRST — a duplicate / unplanned / missing / unknown-stage board refuses before
