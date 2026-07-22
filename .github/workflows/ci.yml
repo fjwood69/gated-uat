@@ -148,6 +148,18 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install "pynacl==1.5.0" "pytest==9.0.3"
+      # SEAL-PATH GUARD (B1 keystone no-silent-skip): the real-podman keystones self-skip when their
+      # OCI image is absent (pytest.mark.skipif). On the AUTHORITATIVE merge gate a silent skip would
+      # go green while the FOLD-A contract proof (SD2/SD7) vanished. Assert the images are present so
+      # an absent image is a HARD failure here, never an invisible skip.
+      - name: Preflight — required OCI images present (keystones MUST run, not skip)
+        run: |
+          for img in localhost/mori:local localhost/mori-uat:local; do
+            if ! podman image exists "$img"; then
+              echo "::error::required image $img absent — real-podman keystones would silently skip and the FOLD-A contract proof (SD2/SD7) would vanish; failing the seal-path gate"
+              exit 1
+            fi
+          done
       # podman present -> the enforcement scenarios (ABA / subject-drift / tamper / degraded /
       # admit) run for REAL; the full suite here is the authoritative merge gate.
       - name: pytest (FULL — real-podman enforcement scenarios)

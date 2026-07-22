@@ -319,10 +319,12 @@ _MANIFEST_KEYS: frozenset[str] = frozenset(
     }
 )
 # The static toolchain pinned IN the signed manifest (dissent gap 4): the render + the static stage
-# enforce against THIS, so an operator cannot silently swap the analyser. env_digest is the
-# authoritative environment coordinate (e.g. the dependency-lock digest or the pinned OCI image id);
-# the wrapper-executable sha is a shim, not the imported code — so env_digest is the pin
-# and the version strings are descriptive.
+# enforce against THIS, so an operator can't silently swap the analyser. env_digest is, SPECIFICALLY
+# (amendment C, gap-1), the static OCI image's RESOLVED CONFIG DIGEST — the ``sha256:<{{.Id}}>`` the
+# sandbox resolves and runs (== the coordinate the enforcement side binds). static_stage ASSERTS the
+# sandbox's observed image config digest == this value, so pinning the image pins ruff + mypy
+# (subsumes per-exe digests). NB: this is an anti-drift IDENTITY (which bytes were presented), NOT a
+# runtime-behaviour assurance; the version strings are descriptive.
 _TOOLCHAIN_KEYS: frozenset[str] = frozenset(
     {"python_version", "ruff_version", "mypy_version", "env_digest"})
 _TASK_KEYS: frozenset[str] = frozenset(
@@ -436,13 +438,21 @@ _CELL_STAGE_KEYS: frozenset[str] = frozenset(
 # not a producer claim: own_tests is the OUT-OF-BAND container exit code; llm_review records the
 # provider/model + raw req/resp digests of a MEASUREMENT; gate carries the digest the enforcement
 # adapter ACTUALLY measured (measured_tree_digest), which MUST equal artifact_tree_digest (P1).
+# static runs IN the hermetic sandbox (gap-1): toolchain identity is the sandbox's resolved image
+# config digest (``env_digest``, asserted == manifest env_digest, subsumes tool digests); the ONLY
+# measured signal is the out-of-band exit code (stdout is DEVNULL); ``invocation_digest`` binds WHAT
+# ran (FOLD-C) so a neutered invocation is auditable. (No tool_versions/findings_count — parsing
+# stdout would re-trust the very output the sandbox discards.)
 _OBS_KEYS_STATIC: frozenset[str] = frozenset(
-    {"tool_versions", "ruff_exit", "mypy_exit", "findings_count"})
+    {"env_digest", "ruff_exit", "mypy_exit", "invocation_digest"})
 _OBS_KEYS_OWN_TESTS: frozenset[str] = frozenset(
-    {"sandbox_isolation_level", "image_digest", "container_exit_code", "pytest_status"})
+    {"sandbox_isolation_level", "image_digest", "container_exit_code", "pytest_status",
+     "invocation_digest"})
+# llm_review binds ``source_digest`` (the canonical sealed-source bytes, reconstructable to
+# artifact_tree_digest — FOLD-B) in addition to the raw request/response digests.
 _OBS_KEYS_LLM_REVIEW: frozenset[str] = frozenset(
-    {"provider_id", "model_id", "review_prompt_hash", "request_digest", "response_digest",
-     "verdict"})
+    {"provider_id", "model_id", "review_prompt_hash", "source_digest", "request_digest",
+     "response_digest", "verdict"})
 _OBS_KEYS_GATE: frozenset[str] = frozenset(
     {"result_kind", "result_reason", "result_sub_reason", "gate_outcome", "measured_tree_digest"})
 _OBS_KEYS_BY_STAGE: dict[str, frozenset[str]] = {
@@ -1160,11 +1170,13 @@ def _validate_cell_observation(
         return
     _check_exact_keys(obs, _OBS_KEYS_BY_STAGE[stage], f"observation[{stage}]")
     if stage == "static":
-        _require(obs, "tool_versions", types=(dict,))
+        # env_digest == the sandbox's resolved image config digest (asserted == manifest env_digest
+        # in static_stage); invocation_digest binds WHAT ran (FOLD-C). The measured signal is the
+        # out-of-band exit codes only.
+        _require_sha256_prefixed(obs, "env_digest")
         ruff_exit = _require(obs, "ruff_exit", types=(int,))
         mypy_exit = _require(obs, "mypy_exit", types=(int,))
-        if _require(obs, "findings_count", types=(int,)) < 0:
-            raise SchemaViolationError("observation.findings_count: must be >= 0")
+        _require_hex64(obs, "invocation_digest")
         # COHERENCE LAW: a measured static run is pass iff BOTH tools exited 0 (else fail); an error
         # is only ever the harness_error path above.
         if outcome not in ("pass", "fail"):
@@ -1189,6 +1201,7 @@ def _validate_cell_observation(
             raise SchemaViolationError(
                 "observation.container_exit_code: must be an int or null, got "
                 f"{type(cec).__name__}")
+        _require_hex64(obs, "invocation_digest")   # FOLD-C: WHAT ran is auditable
         status = _require(obs, "pytest_status", types=(str,))
         if status not in VALID_PYTEST_STATUS:
             raise SchemaViolationError(
@@ -1211,6 +1224,10 @@ def _validate_cell_observation(
         if not _require(obs, "model_id", types=(str,)):
             raise SchemaViolationError("observation.model_id: must be non-empty")
         _require_hex64(obs, "review_prompt_hash")
+        # FOLD-B: source_digest = sha256 of the canonical sealed-source bytes in the request;
+        # reconstructable to artifact_tree_digest (per-file sha256 + raw relpaths). The claim is
+        # harness-BUILT-a-request-embedding-the-source, NOT client-transmitted / model-saw-only.
+        _require_hex64(obs, "source_digest")
         _require_hex64(obs, "request_digest")
         _require_hex64(obs, "response_digest")
         verdict = _require(obs, "verdict", types=(str,))

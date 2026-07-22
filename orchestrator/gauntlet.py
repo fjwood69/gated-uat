@@ -9,37 +9,48 @@ cell is verified against.
 
 Structural laws (made true-by-construction, not merely intended):
 
-  * ONE IMMUTABLE ARTIFACT PER ROW (amendment 3), by CONSTRUCTION not patrol (dissent P1). The
-    artifact is SEALED once per cell into a content-addressed archive (``seal_artifact``); its
-    ``core.tree_hash`` IS the digest bound in every stage receipt. Each stage materialises a FRESH,
-    ephemeral view from the seal (``materialise``, via the gate's own ``safe_extract_tarball``),
-    verified == the seal on extraction, discarded after. No mutable tree is shared across stages, so
-    a mutate->measure->restore attack has nothing persistent to restore into — capability-deletion,
-    not a before/after tripwire. The bound digest is the SEAL's, never re-measured from a stage's
-    (possibly-tampered) view.
+  * ONE IMMUTABLE ARTIFACT PER ROW (amendment 3). The artifact is SEALED once per cell into a
+    content-addressed archive (``seal_artifact``); its ``core.tree_hash`` IS the digest bound in
+    every stage receipt.
+
+  * CAPABILITY-DELETION, not a before/after tripwire (gap-1). No stage is handed a generic
+    host-writable tree. The stage seam is ``StageFn = Callable[[SealedArtifact], ...]``:
+    each stage provisions its OWN isolation directly from the seal —
+
+      - ``static`` + ``own_tests`` extract a fresh view and hand it to a hermetic ``OCISandbox``,
+        binding the SEALED digest (never a re-measurement of the view): ``prepare()`` copytrees the
+        view into its OWN immutable snapshot, re-hashes THAT snapshot, and RAISES
+        ``ArtifactHashMismatchError`` if it != the sealed digest — so an extract->copytree
+        mutation window is closed by the pin, not by an after-hash we control (FOLD-A);
+      - ``llm_review`` reads NO host tree at all: it serialises the sealed artifact's file bytes
+        into a canonical, versioned, domain-separated document (``canonical_review_source``) that a
+        reader can reconstruct ``artifact_tree_digest`` from (FOLD-B), and the review client seam is
+        ``(request_bytes, ...)`` — bytes-in/response-out, no host-fs access (transmit-restriction to
+        the completion path is the Step-3 provider-gate, NOT this seam);
+      - ``gate`` extracts a fresh view for the real enforcement adapter, whose measured digest MUST
+        equal the bound digest (P1 schema law).
+
+    ``extract_view`` verifies the extracted view == the seal BEFORE yielding; its AFTER-hash is
+    honest P3 operator-error DETECTION only (the real isolation is downstream). ``materialise`` +
+    ``_chmod_tree`` (the chmod/after-hash "proof" the board ruled theater) are DELETED.
 
   * UNIFORM TREE POLICY (P1 hardening). ``assert_safe_artifact_tree`` rejects symlinks / HARDLINKS
-    (st_nlink>1, actually detected) / special files up front — the SAME class the gate's tarball
-    path rejects — and every stage extracts through that same tarball path, so the staging paths
-    canonicalise identically. Combined with the gate receipt binding the digest the adapter ACTUALLY
-    measured (schema law), the source-selection false-green vector is unrepresentable.
+    (st_nlink>1) / special files up front — the SAME class the gate's tarball path rejects.
 
-  * COHERENCE IS SCHEMA LAW ON EVERY STAGE (dissent — swept across all four producers). A signed
-    receipt whose outcome contradicts its measurement (own_tests exit!=status, static non-zero-exit
-    'pass', reviewer request_changes 'pass', gate_outcome incoherent with result_kind per the real
-    account()) is unrepresentable — encoded in schemas.validate_cell_stage_payload.
+  * COHERENCE IS SCHEMA LAW ON EVERY STAGE (dissent). A signed receipt whose outcome contradicts its
+    measurement is unrepresentable — encoded in schemas.validate_cell_stage_payload.
 
   * HARNESS-HONEST ERRORS + CELL-LEVEL PUBLISHING. A stage crash / bad view -> a PUBLISHED ERROR
-    receipt ({"harness_error"}). A pre-stage failure (unsafe tree / seal failure) publishes an ERROR
-    receipt for EVERY planned stage (``run_gauntlet``), so no planned cell vanishes from the
-    denominator (amendment 2 under every failure geometry) — a publishing path, never an escape.
+    receipt ({"harness_error"}). A pre-stage failure publishes an ERROR receipt for EVERY planned
+    stage (``run_gauntlet``) so no planned cell vanishes from the denominator.
 
-``gate.*`` / ``sandbox.*`` imports are DEFERRED into the functions that need them so this module
-imports with only ``core`` + sibling ``orchestrator`` modules on the path.
+``gate.*`` / ``sandbox.*`` / ``core.chain`` imports are DEFERRED into the functions that need them
+so this module imports with only ``core`` + sibling ``orchestrator`` modules on the path.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -71,17 +82,33 @@ GAUNTLET_STAGES: tuple[str, ...] = ("static", "own_tests", "llm_review", "gate")
 # receipt by the sentinel schema law (forces outcome=error + harness_error), not by crypto accident.
 UNMEASURABLE_DIGEST = UNMEASURABLE_TREE_DIGEST
 
+# Container mount points (== sandbox.oci.ARTIFACT_MOUNT / WORK_DIR — literals to keep the pin import
+# deferred; a drift would be caught by the real-podman keystone).
+_ARTIFACT_MOUNT = "/artifact"
+_WORK_DIR = "/work"
+
+# The pinned in-container static toolchain invocations (ruff + mypy), run over the :ro /artifact
+# mount with caches directed at the writable tmpfs /work. The TOOLCHAIN identity is the sandbox
+# image's resolved config digest (asserted == manifest env_digest), which subsumes per-exe digests.
+_RUFF_ARGV: tuple[str, ...] = (
+    "ruff", "check", "--no-fix", "--cache-dir", "/work/ruff", "/artifact")
+_MYPY_ARGV: tuple[str, ...] = (
+    "mypy", "--cache-dir", "/work/mypy", "--no-error-summary", "/artifact")
+# The producer suite, run inside the container over the ro artifact. ``-B`` keeps __pycache__ out of
+# the read-only /artifact; ``-p no:cacheprovider`` writes no .pytest_cache; cwd is the tmpfs /work.
+_PYTEST_ARGV: tuple[str, ...] = (
+    "python3", "-B", "-m", "pytest", "/artifact", "-p", "no:cacheprovider", "-q")
+
 
 class DigestMismatchError(RuntimeError):
-    """A materialised stage view's ``tree_hash`` != the sealed digest (verified on extraction).
-    A mismatch means the view is not the sealed artifact — the stage's observation is void.
-    Surfaced as a PUBLISHED ERROR receipt, never a silent rerun (amendment 3)."""
+    """An extracted stage view's ``tree_hash`` != the sealed digest (verified on extraction). The
+    view is not the sealed artifact — surfaced as a PUBLISHED ERROR, never a silent rerun."""
 
 
 class UnsafeArtifactError(ValueError):
-    """The artifact tree contains a symlink / hardlink / special file — rejected up front (the SAME
-    policy the gate's tarball extractor enforces) so the gauntlet's staging paths cannot diverge
-    from the gate's on link representation (P1 hardening)."""
+    """The artifact tree contains a symlink / hardlink / special file / duplicate path — rejected up
+    front (the SAME policy the gate's tarball extractor enforces) so the gauntlet's staging paths
+    cannot diverge from the gate's (P1 hardening)."""
 
 
 class HarnessMisconfigError(RuntimeError):
@@ -100,8 +127,7 @@ class CellContext:
     """The signed-into-every-receipt identity of one board cell, echoed from the manifest.
 
     ``planned_run_id`` is the manifest's UUID4 for this cell; it is the ``cell_stage`` receipt's
-    run_id (envelope-signed) — so "binds planned_run_id" (carry-in 1) is structural.
-    ``manifest_digest`` is the signed manifest receipt's digest (the board anchor).
+    run_id (envelope-signed). ``manifest_digest`` is the signed manifest receipt's digest (anchor).
     ``reviewer_lineage`` != ``lineage``.
     """
 
@@ -115,18 +141,13 @@ class CellContext:
 
 @dataclass(frozen=True)
 class StageObservation:
-    """The pure result of running one stage over the immutable snapshot — turned into a signed
-    receipt by ``build_cell_stage_receipt``. ``outcome`` is one of schemas.VALID_CELL_OUTCOMES;
+    """The pure result of running one stage over the sealed artifact — turned into a signed receipt
+    by ``build_cell_stage_receipt``. ``outcome`` is one of schemas.VALID_CELL_OUTCOMES;
     ``observation`` is the stage-shaped observation dict (validated at receipt-build time)."""
 
     stage: str
     outcome: str
     observation: dict[str, Any]
-
-
-# A stage is a pure function of the immutable snapshot path. Callers close over any extra inputs
-# (image digest, budget, review client) so the cell runner stays generic.
-StageFn = Callable[[Path], StageObservation]
 
 
 # ------------------------------------------------------------------
@@ -150,19 +171,16 @@ def harness_code_sha() -> str:
 
 
 # ------------------------------------------------------------------
-# The immutable artifact + the before/after digest guard
+# The immutable artifact + the fresh per-stage view
 # ------------------------------------------------------------------
 
 
 def assert_safe_artifact_tree(root: Path) -> None:
     """Reject an artifact tree containing a symlink, HARDLINK, or special file (device/fifo/etc) —
-    the SAME class the gate's ``safe_extract_tarball`` rejects. Source trees rarely need links; a
-    tree that does fails closed. This keeps ``core.tree_hash`` over the tree = ``F:``-only, so the
-    own_tests sandbox copy and the gate adapter copy canonicalise identically (P1 hardening).
-
-    Hardlinks are DETECTED, not merely claimed (dissent): a regular file with ``st_nlink > 1``
-    shares
-    an inode with another name — rejected, so a claimed rejection is one we actually perform."""
+    the SAME class the gate's ``safe_extract_tarball`` rejects. This keeps ``core.tree_hash`` over
+    the tree = ``F:``-only, so the sandbox copy and the gate adapter copy canonicalise identically
+    (P1 hardening). Hardlinks are DETECTED (``st_nlink > 1`` on a regular file), not merely
+    claimed."""
     if not root.exists():
         raise UnsafeArtifactError(f"artifact path does not exist: {root}")
     if root.is_symlink():
@@ -184,9 +202,7 @@ class SealedArtifact:
     """The artifact sealed ONCE as a content-addressed archive. ``digest`` == ``core.tree_hash`` of
     the tree == the ``artifact_tree_digest`` bound in every cell receipt. ``archive`` is a read-only
     tar (top-level prefix ``artifact/``) — the single immutable source from which each stage
-    materialises a FRESH, ephemeral view. No mutable tree is shared across stages, so a
-    mutate->measure->restore attack has nothing persistent to restore into (dissent P1: immutability
-    by construction, not by a before/after tripwire)."""
+    provisions a FRESH view (or reads canonical bytes). Frozen: no stage can redirect it."""
 
     archive: Path
     digest: str
@@ -194,9 +210,8 @@ class SealedArtifact:
 
 class SealError(RuntimeError):
     """The artifact could not be sealed into its immutable archive (a copy/tar failure). A
-    cell-level
-    failure — run_gauntlet publishes an ERROR receipt for every stage rather than dropping the
-    cell."""
+    cell-level failure — run_gauntlet publishes an ERROR receipt for every stage rather than
+    dropping the cell."""
 
 
 @contextmanager
@@ -206,16 +221,18 @@ def seal_artifact(artifact_dir: Path) -> Iterator[SealedArtifact]:
     ``core.tree_hash`` of the ORIGINAL tree (== every stage's bound digest). Purged on exit."""
     import tarfile
     assert_safe_artifact_tree(artifact_dir)
+    if not artifact_dir.is_dir():
+        # B1 artifacts are directory TREES. A file-root hashes under core.tree_hash's "" relpath
+        # rule but seals under 'artifact/<name>', so canonical_review_source could not reconstruct
+        # sealed.digest (consult P1). Forbid it rather than carry a special case.
+        raise UnsafeArtifactError(f"artifact must be a directory tree, not a file: {artifact_dir}")
     digest = tree_hash(artifact_dir)
     seal_dir = Path(tempfile.mkdtemp(prefix="gauntlet-seal-"))
     try:
         archive = seal_dir / "artifact.tar"
         try:
             with tarfile.open(archive, "w") as tf:
-                if artifact_dir.is_dir():
-                    tf.add(artifact_dir, arcname="artifact", recursive=True)
-                else:
-                    tf.add(artifact_dir, arcname=f"artifact/{artifact_dir.name}")
+                tf.add(artifact_dir, arcname="artifact", recursive=True)
             os.chmod(archive, 0o444)  # read-only seal
         except (OSError, tarfile.TarError) as exc:
             raise SealError(f"could not seal artifact {artifact_dir}: {exc}") from exc
@@ -232,41 +249,25 @@ def verify_tree(tree: Path, expected_digest: str) -> None:
             f"artifact_tree_digest mismatch: expected {expected_digest!r}, tree is {actual!r}")
 
 
-def _chmod_tree(root: Path, *, writable: bool) -> None:
-    """Recursively set every entry read-only (dirs 0o555, files 0o444) or restore write (dirs 0o755,
-    files 0o644). Owner-chmod succeeds regardless of a parent dir's write bit; restore precedes the
-    rmtree so a read-only view can be purged."""
-    for p in (root, *root.rglob("*")):
-        try:
-            if writable:
-                p.chmod(0o755 if p.is_dir() else 0o644)
-            else:
-                p.chmod(0o555 if p.is_dir() else 0o444)
-        except OSError:
-            pass
-
-
 @contextmanager
-def materialise(sealed: SealedArtifact) -> Iterator[Path]:
-    """Materialise a FRESH, ephemeral, READ-ONLY view of the sealed artifact for ONE stage.
+def extract_view(sealed: SealedArtifact) -> Iterator[Path]:
+    """Extract a FRESH, ephemeral view of the sealed artifact for ONE stage's re-isolating consumer
+    (an ``OCISandbox`` mount source, or the gate adapter's copy source), and discard it after.
 
     Extraction uses the gate's own trusted ``safe_extract_tarball`` (so every stage canonicalises
-    identically), then the view is verified == the seal (BEFORE), chmod'd unwritable at
-    the filesystem level, yielded, and re-verified == the seal (AFTER) — the after-check is the
-    cryptographic PROOF the read-only constraint held during the stage (dissent gap 2), not mere
-    defence-in-depth. A stage that tries to write its view fails with an OS error; a stage that
-    somehow mutated it fails the after-check -> a published ERROR receipt. (own_tests gets the
-    STRONGER form — a ``:ro`` bind mount inside the OCISandbox.)"""
+    identically), then the view is verified == the seal BEFORE it is yielded. There is NO chmod: the
+    view is not the measured surface — the consumer re-isolates (the sandbox copytrees the view into
+    its OWN immutable snapshot and re-hashes THAT against the sealed digest; the gate adapter
+    re-copies + re-measures). The AFTER verify is honest P3 operator-error DETECTION (a drift flags
+    harness/operator error), NOT a security proof — the downstream re-measurement is the proof."""
     from gate.artifact import safe_extract_tarball
     view = Path(tempfile.mkdtemp(prefix="gauntlet-view-"))
     try:
         safe_extract_tarball(sealed.archive, view)
-        verify_tree(view, sealed.digest)   # BEFORE: the view IS the sealed bytes, or we refuse
-        _chmod_tree(view, writable=False)  # genuinely read-only at the FS level
+        verify_tree(view, sealed.digest)   # the extracted view IS the sealed bytes, or we refuse
         yield view
-        verify_tree(view, sealed.digest)   # AFTER: proof the read-only constraint held this stage
+        verify_tree(view, sealed.digest)   # P3 DETECTION only (downstream re-measurement is proof)
     finally:
-        _chmod_tree(view, writable=True)   # restore write so the view can be purged
         shutil.rmtree(view, ignore_errors=True)
 
 
@@ -313,6 +314,12 @@ def _error_receipt(
         cell, stage, "error", {"harness_error": reason}, artifact_tree_digest, signing_key)
 
 
+# A stage is a pure function of the SEALED artifact — each stage provisions its OWN isolation from
+# the seal (extract_view into a re-isolating consumer, or canonical bytes). No generic
+# host-writable view seam exists (gap-1 capability-deletion).
+StageFn = Callable[[SealedArtifact], StageObservation]
+
+
 def run_stage(
     cell: CellContext,
     sealed: SealedArtifact,
@@ -321,23 +328,19 @@ def run_stage(
     stage_fn: StageFn,
     signing_key: SigningKey,
 ) -> Receipt:
-    """Run ONE stage over a FRESH materialised view of the sealed artifact and return its signed
-    receipt.
+    """Run ONE stage over the sealed artifact and return its signed receipt.
 
-    A materialise DigestMismatchError, a bad extraction, or ANY unexpected exception from the stage
-    becomes a PUBLISHED ERROR receipt (outcome=error, harness_error) — the cell is never silently
-    rerun. A normal return is turned into a signed receipt from the stage's ``StageObservation``; if
-    that observation is malformed the schema rejects it at build time (fail-closed, surfaced as an
-    ERROR receipt rather than an unsigned exception)."""
+    The stage provisions its own isolation from the seal; ANY exception (a provisioning failure, an
+    extract_view DigestMismatchError, an image drift, or any crash) becomes a PUBLISHED ERROR
+    receipt (outcome=error, harness_error) — the cell is never silently rerun. A normal return is
+    turned into a signed receipt; a malformed observation is rejected by the schema at build time
+    (fail-closed, surfaced as an ERROR receipt rather than an unsigned exception)."""
     try:
-        with materialise(sealed) as view:   # fresh, ephemeral, verified == the seal
-            result = stage_fn(view)
+        result = stage_fn(sealed)
         if result.stage != stage:
             raise ValueError(f"stage_fn returned stage {result.stage!r}, expected {stage!r}")
         return build_cell_stage_receipt(
             cell, stage, result.outcome, result.observation, artifact_tree_digest, signing_key)
-    except DigestMismatchError as exc:
-        return _error_receipt(cell, stage, artifact_tree_digest, f"materialise: {exc}", signing_key)
     except Exception as exc:  # noqa: BLE001 — any stage failure is a published ERROR row
         return _error_receipt(
             cell, stage, artifact_tree_digest, f"{type(exc).__name__}: {exc}", signing_key)
@@ -351,19 +354,17 @@ def run_gauntlet(
 ) -> list[Receipt]:
     """Run the full ordered gauntlet for one cell and return the ordered list of signed cell_stage
     receipts (one per stage in ``GAUNTLET_STAGES``). The artifact is SEALED once (the immutable row
-    artifact); each stage materialises a fresh view from the seal. ``stage_fns`` maps each stage
-    name to its closure (image, budget, reviewer).
+    artifact); each stage provisions a fresh view/bytes from the seal. ``stage_fns`` maps each stage
+    name to its closure (image, env_digest, budget, reviewer).
 
     TOTAL CELL EXCEPTION PERIMETER (dissent gaps 1 + 2a): the ENTIRE per-cell dispatch — the
     stage_fns configuration check, the preflight (assert_safe, lstat-only, no open — a FIFO is
-    rejected before ``_hash_file`` can block on it), the seal, and every stage — lives INSIDE one
-    catch-all whose contract is "publish four ERROR receipts or die trying". There is NO exception
-    type (harness misconfig / KeyError, unsafe tree, seal IO, hang-avoided-preflight, missing/
-    unreadable) that exits ``run_gauntlet`` without filling the cell. Raising is reserved for a
-    failure of the PUBLISHING machinery itself (``_error_receipt``) — at which point the run is
-    UNATTESTABLE and the board must not render, the correct terminal. The ERROR receipts bind the
-    UNMEASURABLE sentinel (the tree was not safely measured); the sentinel schema law forces
-    outcome=error + harness_error."""
+    rejected before hashing can block on it), the seal, and every stage — lives INSIDE one catch-all
+    whose contract is "publish four ERROR receipts or die trying". No exception type exits
+    ``run_gauntlet`` without filling the cell; raising is reserved for a failure of the PUBLISHING
+    machinery itself, when the run is UNATTESTABLE the board must not render. The ERROR
+    receipts bind the UNMEASURABLE sentinel; the sentinel schema law forces outcome=error +
+    harness_error."""
     try:
         missing = [s for s in GAUNTLET_STAGES if s not in stage_fns]
         if missing:
@@ -378,118 +379,195 @@ def run_gauntlet(
 
 
 # ------------------------------------------------------------------
-# Stage: static (ruff + mypy, pinned, deterministic) — NO artifact runtime code executes
+# Canonical review source + the shared hermetic-sandbox runner
 # ------------------------------------------------------------------
 
 
+def _strip_seal_prefix(name: str) -> str | None:
+    """Strip the seal's top-level ``artifact/`` component from a tar member name — IDENTICAL to the
+    gate extractor's ``_strip_top_level`` (split on the first ``/``), so a review-source relpath ==
+    the extracted-view relpath == the ``core.tree_hash`` relpath. None for the prefix dir."""
+    parts = name.split("/", 1)
+    return parts[1] if len(parts) == 2 and parts[1] else None
+
+
+def canonical_review_source(sealed: SealedArtifact) -> bytes:
+    """Serialise the sealed artifact's FILE BYTES into a canonical, versioned, domain-separated
+    document — the exact bytes the LLM reviewer is shown (FOLD-B). Reads the tar MEMBERS (not the
+    raw tar bytes — tar metadata is not the artifact); sorts by the RAW utf-8 relpath (mirroring
+    ``core.tree_hash``); records for each file its relpath (base64 — ASCII, so canonical_bytes' NFC
+    normalisation cannot alter the raw path bytes), its ``sha256(bytes)``, and its content (base64).
+
+    Reconstruction-exact: an auditor recomputes ``core.tree_hash`` from the (relpath, sha256) pairs
+    (F:+sha256 per file, sorted by relpath, Merkle over rel\\0digest\\0) and confirms it equals
+    the receipt's ``artifact_tree_digest`` — so ``source_digest`` verifiably corresponds to the
+    sealed artifact. Duplicate relpaths (after strip) fail closed. Symlinks/specials cannot occur
+    (the seal rejects them), so every entry is a regular file."""
+    import tarfile
+
+    from core.chain import canonical_bytes
+    files: list[tuple[str, bytes]] = []
+    seen: set[str] = set()
+    with tarfile.open(sealed.archive, "r") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            rel = _strip_seal_prefix(member.name)
+            if rel is None:
+                continue
+            if rel in seen:
+                raise UnsafeArtifactError(f"duplicate path in sealed source: {rel!r}")
+            seen.add(rel)
+            src = tf.extractfile(member)
+            files.append((rel, src.read() if src is not None else b""))
+    files.sort(key=lambda e: e[0].encode("utf-8"))   # mirror core.tree_hash ordering exactly
+    # In-stage fail-closed self-check (consult P2): reconstruct core.tree_hash's Merkle root
+    # from (relpath, per-file sha256) using its EXACT construction (F:+sha256, rel\0digest\0 pairs,
+    # sha256: prefix) and refuse if it != the sealed digest — a serializer drift can never ship a
+    # source that does not correspond to the bound artifact_tree_digest.
+    root_h = hashlib.sha256()
+    for rel, data in files:
+        entry = "F:" + hashlib.sha256(data).hexdigest()
+        root_h.update(rel.encode("utf-8"))
+        root_h.update(b"\0")
+        root_h.update(entry.encode("utf-8"))
+        root_h.update(b"\0")
+    reconstructed = f"sha256:{root_h.hexdigest()}"
+    if reconstructed != sealed.digest:
+        raise DigestMismatchError(
+            f"review source does not reconstruct the sealed digest: {reconstructed!r} != "
+            f"{sealed.digest!r}")
+    payload = {
+        "files": [
+            {
+                "path_b64": base64.b64encode(rel.encode("utf-8")).decode("ascii"),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            }
+            for rel, data in files
+        ]
+    }
+    return canonical_bytes("gated-uat.review-source", payload)
+
+
+# A sandbox factory: constructs a FRESH sandbox for one stage run (default: a real OCISandbox).
+MakeSandbox = Callable[[], Any]
+
+
 @dataclass(frozen=True)
-class StaticTools:
-    """The pinned static toolchain. ``ruff_argv``/``mypy_argv`` are argv prefixes (the resolved
-    executables) so a test can inject fakes. TOOLCHAIN PIN (dissent): the executable's content sha
-    is a CAPTURED coordinate, not merely "whatever PATH supplied" — it is recorded in every static
-    observation AND, when ``expected_ruff_digest``/``expected_mypy_digest`` are set (a SEALED board
-    run), ENFORCED (a drift fails the stage closed). Runs on the HOST: ruff never executes the
-    target's runtime code and mypy is static analysis. RESIDUAL (documented, out of B1 scope): a
-    malicious ``[tool.mypy]`` plugin / imported conftest could execute during mypy collection — the
-    controlled B1 corpus contains none; a hardening path is to run static in the hermetic
-    container."""
+class _SandboxRun:
+    """The out-of-band facts a hermetic sandbox run yields: the resolved image config digest, the
+    real isolation level, and per-argv exit codes (None if a run did not cleanly complete)."""
 
-    ruff_argv: tuple[str, ...]
-    mypy_argv: tuple[str, ...]
-    python_version: str
-    expected_ruff_digest: str | None = None   # sha256:<hex> of the ruff executable; enforced if set
-    expected_mypy_digest: str | None = None   # sha256:<hex> of the mypy executable; enforced if set
+    image_digest: str
+    isolation_level: str
+    exit_codes: tuple[int | None, ...]
 
 
-def _run(argv: list[str], cwd: Path) -> tuple[int, str]:
-    import subprocess
-    proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True, timeout=120)
-    return proc.returncode, proc.stdout
+def _run_argvs_in_sandbox(
+    sealed: SealedArtifact,
+    *,
+    image: str,
+    argvs: tuple[tuple[str, ...], ...],
+    budget_seconds: float,
+    make_sandbox: MakeSandbox | None,
+) -> _SandboxRun:
+    """Extract a fresh view, prepare a FRESH hermetic sandbox over it BINDING THE SEALED DIGEST
+    (FOLD-A: ``prepare()`` re-hashes its snapshot and raises if it != sealed.digest — so an
+    extract->copytree mutation is caught by the pin, not an after-hash we control), run each argv in
+    turn over the ro /artifact, and return the out-of-band facts. Teardown CONFIRMS destruction."""
+    from core import ArtifactSpec, Command, Fixtures, ResourceBudget
+
+    def _default_factory() -> Any:
+        from sandbox.oci import OCISandbox
+        return OCISandbox(image=image)
+
+    factory = make_sandbox or _default_factory
+    sandbox = factory()  # a fresh sandbox object per cell — never reused across runs (P2)
+    # Record the sandbox's REAL isolation level; a weaker (or absent) level fails closed
+    # at schema validation rather than being masked.
+    level = getattr(getattr(sandbox, "isolation_level", None), "value", "unknown")
+    with extract_view(sealed) as view:
+        spec = ArtifactSpec(path=view, tree_hash=sealed.digest)  # FOLD-A: SEALED digest, not view's
+        handle = sandbox.prepare(spec, Fixtures())
+        try:
+            results = [
+                sandbox.run(handle, Command(argv=tuple(argv)),
+                            ResourceBudget(wall_clock_seconds=budget_seconds))
+                for argv in argvs
+            ]
+        finally:
+            sandbox.teardown(handle)  # CONFIRMS destruction (SandboxLeakError if it cannot)
+    image_digest = str(results[0].image_digest) if results else "unknown"
+    exit_codes = tuple(
+        int(r.exit_code) if (r.outcome == "completed" and r.exit_code is not None) else None
+        for r in results)
+    return _SandboxRun(image_digest=image_digest, isolation_level=str(level), exit_codes=exit_codes)
 
 
-def _exe_digest(argv0: str) -> str:
-    """sha256:<hex> of the executable file at ``argv0`` (the pinned toolchain coordinate). 'unknown'
-    only if the path is not a readable file (a fake argv), which a sealed run's enforcement
-    rejects."""
-    p = Path(argv0)
-    if not p.is_file():
-        return "unknown"
-    return "sha256:" + hashlib.sha256(p.read_bytes()).hexdigest()
+def _invocation_digest(image_digest: str, argvs: tuple[tuple[str, ...], ...]) -> str:
+    """A canonical digest of exactly WHAT was run (image config digest + the ordered argvs + the ro
+    mount + workdir) — bound into the observation so a static/own_tests pass is auditable (FOLD-C:
+    guards a neutered invocation like ``ruff --select NOTHING`` that the exit code alone can't
+    reveal)."""
+    from core.chain import canonical_bytes
+    payload = {
+        "image_digest": image_digest,
+        "mount": f"{_ARTIFACT_MOUNT}:ro",
+        "workdir": _WORK_DIR,
+        "argvs": [list(argv) for argv in argvs],
+    }
+    return hashlib.sha256(canonical_bytes("gated-uat.invocation", payload)).hexdigest()
 
 
-def static_stage(view: Path, tools: StaticTools | None = None) -> StageObservation:
-    """Run ruff + mypy (pinned) over the materialised view; observe (exits, findings_count,
-    tool_versions incl the executable DIGESTS). Deterministic: caches are directed OUTSIDE the view.
-    outcome = pass iff both tools exit 0. If the toolchain digests are pinned and the on-disk
-    executable's digest differs, the stage fails closed (a captured coordinate, enforced)."""
-    import subprocess
-    t = tools or default_static_tools()
-    ruff_digest = _exe_digest(t.ruff_argv[0])
-    mypy_digest = _exe_digest(t.mypy_argv[0])
-    if t.expected_ruff_digest is not None and ruff_digest != t.expected_ruff_digest:
+# ------------------------------------------------------------------
+# Stage: static (ruff + mypy IN-CONTAINER, over the ro /artifact) — no artifact runtime executes
+# ------------------------------------------------------------------
+#
+# Static runs INSIDE the hermetic OCISandbox (not on the host): the sandbox image is the pinned
+# toolchain, and its resolved config digest is ASSERTED == the manifest env_digest — pinning the
+# image pins ruff + mypy (subsumes per-exe digests) and closes the host-side mypy-plugin-execution
+# residual. The ONLY observation is the out-of-band exit code (stdout is DEVNULL in the sandbox);
+# parsing tool stdout would re-trust the very output the sandbox deliberately discards. A static
+# ``pass`` therefore means "the pinned tools exited 0", NOT "no static defects exist" (the artifact
+# ships its own config and can suppress findings — on-thesis for the complicit-tooling demo;
+# the gate is the boundary). The invocation vector is bound (FOLD-C) so what ran is auditable.
+
+
+def static_stage(
+    sealed: SealedArtifact,
+    *,
+    image: str,
+    env_digest: str,
+    ruff_argv: tuple[str, ...] = _RUFF_ARGV,
+    mypy_argv: tuple[str, ...] = _MYPY_ARGV,
+    budget_seconds: float = 120.0,
+    make_sandbox: MakeSandbox | None = None,
+) -> StageObservation:
+    """Run ruff + mypy in the pinned hermetic sandbox over the ro artifact; assert the sandbox's
+    resolved image config digest == the manifest ``env_digest`` (drift -> ERROR); observe exit codes
+    only. outcome = pass iff both exit 0. A run that does not cleanly complete (timeout / sandbox
+    error) raises -> a published ERROR receipt."""
+    argvs = (ruff_argv, mypy_argv)
+    run = _run_argvs_in_sandbox(
+        sealed, image=image, argvs=argvs, budget_seconds=budget_seconds, make_sandbox=make_sandbox)
+    if run.image_digest != env_digest:
         raise RuntimeError(
-            f"ruff toolchain digest drift: pinned {t.expected_ruff_digest!r}, "
-            f"on-disk {ruff_digest!r}")
-    if t.expected_mypy_digest is not None and mypy_digest != t.expected_mypy_digest:
-        raise RuntimeError(
-            f"mypy toolchain digest drift: pinned {t.expected_mypy_digest!r}, "
-            f"on-disk {mypy_digest!r}")
-    with tempfile.TemporaryDirectory(prefix="gauntlet-static-") as scratch:
-        ruff_cache = str(Path(scratch) / "ruff")
-        mypy_cache = str(Path(scratch) / "mypy")
-        # ruff: JSON output so findings are countable; cache OUTSIDE the view.
-        ruff_argv = [*t.ruff_argv, "check", "--no-fix", "--output-format", "json",
-                     "--cache-dir", ruff_cache, str(view)]
-        try:
-            ruff_rc, ruff_out = _run(ruff_argv, Path(scratch))
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"ruff invocation failed: {exc}") from exc
-        try:
-            findings = len(json.loads(ruff_out)) if ruff_out.strip() else 0
-        except json.JSONDecodeError:
-            findings = 0
-        # mypy: cache OUTSIDE the view; run from scratch cwd so no .mypy_cache lands in it.
-        mypy_argv = [*t.mypy_argv, "--cache-dir", mypy_cache, "--no-error-summary", str(view)]
-        try:
-            mypy_rc, _ = _run(mypy_argv, Path(scratch))
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"mypy invocation failed: {exc}") from exc
-    outcome = "pass" if (ruff_rc == 0 and mypy_rc == 0) else "fail"
+            f"static toolchain image drift: manifest env_digest {env_digest!r}, "
+            f"sandbox ran {run.image_digest!r}")
+    ruff_exit, mypy_exit = run.exit_codes[0], run.exit_codes[1]
+    if ruff_exit is None or mypy_exit is None:
+        raise RuntimeError(f"static sandbox run did not complete: exits={run.exit_codes!r}")
+    outcome = "pass" if (ruff_exit == 0 and mypy_exit == 0) else "fail"
     return StageObservation(
         stage="static",
         outcome=outcome,
         observation={
-            "tool_versions": {
-                "ruff": _tool_version([*t.ruff_argv, "--version"]),
-                "ruff_exe_digest": ruff_digest,
-                "mypy": _tool_version([*t.mypy_argv, "--version"]),
-                "mypy_exe_digest": mypy_digest,
-                "python": t.python_version,
-            },
-            "ruff_exit": int(ruff_rc),
-            "mypy_exit": int(mypy_rc),
-            "findings_count": int(findings),
+            "env_digest": run.image_digest,
+            "ruff_exit": ruff_exit,
+            "mypy_exit": mypy_exit,
+            "invocation_digest": _invocation_digest(run.image_digest, argvs),
         },
-    )
-
-
-def _tool_version(argv: list[str]) -> str:
-    import subprocess
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=30)
-        return proc.stdout.strip() or proc.stderr.strip() or "unknown"
-    except (OSError, subprocess.SubprocessError):
-        return "unknown"
-
-
-def default_static_tools() -> StaticTools:
-    """Pinned static toolchain from the ``ruff`` / ``mypy`` executables on PATH (they are installed
-    as standalone binaries, not importable modules, so ``python -m ruff`` is not available)."""
-    import sys
-    return StaticTools(
-        ruff_argv=(shutil.which("ruff") or "ruff",),
-        mypy_argv=(shutil.which("mypy") or "mypy",),
-        python_version=sys.version.split()[0],
     )
 
 
@@ -500,78 +578,39 @@ def default_static_tools() -> StaticTools:
 # own-tests GREEN on the evasion is the demonstration — the producer's tests are complicit; that is
 # the thesis of the board. Do not make this stage catch the evasion.
 #
-# The stage runs the PRODUCER'S OWN pytest suite inside a fresh hermetic OCISandbox — the SAME
-# isolation the gate uses (IsolationLevel.HERMETIC): /artifact mounted read-only,
-# ``--network=none``,
-# a sterile env (no host env, no host mounts but the ro artifact), a writable tmpfs /work, and a
-# teardown that CONFIRMS container destruction. The ONLY observation is the CONTAINER EXIT CODE,
-# read
-# out-of-band by the orchestrator — never the producer's stdout, which is untrusted. P2 hardening: a
-# FRESH sandbox object is constructed per cell (never reused across runs), and the sandbox exposes
-# no
-# shared writable mount beyond the ro artifact + the per-run tmpfs, so the untrusted pytest cannot
-# reach the orchestrator's signing key or a concurrent gate run's state. (The signing key living in
-# the orchestrator process is a documented residual; an HSM / constant-time signing is out of B1
-# scope.)
-
-# The producer suite, run inside the container over the ro artifact. ``-B`` keeps __pycache__ out of
-# the read-only /artifact; ``-p no:cacheprovider`` writes no .pytest_cache; cwd is the tmpfs /work.
-_PYTEST_ARGV: tuple[str, ...] = (
-    "python3", "-B", "-m", "pytest", "/artifact", "-p", "no:cacheprovider", "-q")
-
-# A sandbox factory: constructs a FRESH sandbox for one own_tests run (default: a real OCISandbox).
-SandboxFactory = Callable[[], Any]
+# The stage runs the PRODUCER'S OWN pytest suite inside a fresh hermetic OCISandbox (the SAME
+# isolation the gate uses): /artifact mounted read-only (bound to the SEALED digest — FOLD-A),
+# --network=none, sterile env, writable tmpfs /work, teardown that CONFIRMS container destruction.
+# The ONLY observation is the container EXIT CODE, read out-of-band — never the producer's stdout.
 
 
 def own_tests_stage(
-    view: Path,
+    sealed: SealedArtifact,
     *,
     image: str,
     budget_seconds: float = 120.0,
-    make_sandbox: SandboxFactory | None = None,
+    make_sandbox: MakeSandbox | None = None,
     pytest_argv: tuple[str, ...] = _PYTEST_ARGV,
 ) -> StageObservation:
-    """Run the producer's pytest in a FRESH hermetic sandbox over the materialised view; observe
-    ONLY
+    """Run the producer's pytest in a FRESH hermetic sandbox over the sealed artifact; observe ONLY
     the out-of-band container exit code. Isolation is the gate's (HERMETIC). own-tests GREEN on the
-    evasion is intentional (the thesis) — this stage never inspects WHAT the tests assert.
-    ``make_sandbox`` is injectable for tests; the default constructs a fresh
-    ``sandbox.oci.OCISandbox(image)`` (deferred import)."""
-    from core import ArtifactSpec, Command, Fixtures, ResourceBudget
-
-    def _default_factory() -> Any:
-        from sandbox.oci import OCISandbox
-        return OCISandbox(image=image)
-
-    factory = make_sandbox or _default_factory
-    spec = ArtifactSpec(path=view, tree_hash=tree_hash(view))
-    sandbox = factory()  # P2: a fresh sandbox object per cell — never reused across runs
-    # Record the sandbox's REAL isolation level; the schema requires 'hermetic' for own_tests, so a
-    # weaker (or absent -> 'unknown') level fails closed rather than being masked as hermetic.
-    level = getattr(getattr(sandbox, "isolation_level", None), "value", "unknown")
-    handle = sandbox.prepare(spec, Fixtures())
-    try:
-        result = sandbox.run(
-            handle, Command(argv=tuple(pytest_argv)),
-            ResourceBudget(wall_clock_seconds=budget_seconds))
-    finally:
-        sandbox.teardown(handle)  # CONFIRMS destruction (SandboxLeakError if it cannot)
-
-    if result.outcome == "completed" and result.exit_code is not None:
-        exit_code: int | None = int(result.exit_code)
-    else:
-        # timeout / container-level error: no clean exit code -> pytest_status='error'
-        exit_code = None
-    # status + outcome via the CANONICAL schema maps (single source; own_tests + schema agree).
+    evasion is intentional (the thesis) — this stage never inspects WHAT the tests assert."""
+    argvs = (pytest_argv,)
+    run = _run_argvs_in_sandbox(
+        sealed, image=image, argvs=argvs, budget_seconds=budget_seconds, make_sandbox=make_sandbox)
+    exit_code = run.exit_codes[0]
+    # status + outcome via the CANONICAL schema maps (single source; own_tests + schema agree). A
+    # non-completing run (exit None) -> status 'error' -> cell outcome 'error'.
     status = expected_pytest_status(exit_code)
     return StageObservation(
         stage="own_tests",
         outcome=OWN_TESTS_CELL_OUTCOME[status],
         observation={
-            "sandbox_isolation_level": str(level),
-            "image_digest": str(result.image_digest),
+            "sandbox_isolation_level": run.isolation_level,
+            "image_digest": run.image_digest,
             "container_exit_code": exit_code,
             "pytest_status": status,
+            "invocation_digest": _invocation_digest(run.image_digest, argvs),
         },
     )
 
@@ -580,49 +619,74 @@ def own_tests_stage(
 # Stage: llm_review (a MEASUREMENT stage, NOT a security boundary)
 # ------------------------------------------------------------------
 #
-# A cross-lineage reviewer (reviewer_lineage != lineage, fixed by the manifest) is shown the
-# artifact
-# under a FIXED, PUBLISHED review prompt (its hash committed in the manifest) and returns a
-# STRUCTURED
-# verdict. Strict ``approve`` -> PASS; anything else -> the reviewer requested changes (it "caught"
-# something). The board records the provider/model id and the raw request/response DIGESTS so the
-# measurement is auditable — but the reviewer is a MEASUREMENT, not a security boundary: a
-# hallucinated
-# or fooled verdict is a measurement error, not a breach (the gate is the boundary). For a
-# well-constructed evasion the reviewer may well approve (green) — that, like own-tests being
-# complicit, is part of what the gate-BLOCKED column then demonstrates.
+# A cross-lineage reviewer (reviewer_lineage != lineage, fixed by the manifest) reviews the sealed
+# artifact under a FIXED, PUBLISHED review prompt (its hash committed in the manifest) and returns a
+# STRUCTURED verdict. Strict ``approve`` -> PASS. CONTAINMENT IS STRUCTURAL (consult P1): the STAGE
+# builds the canonical request envelope that EMBEDS the sealed source bytes and computes
+# ``request_digest`` over THOSE bytes — the client is handed the request to transmit and cannot
+# substitute a different body while still matching the bound digest. Two independent digests
+# (source, request) don't prove containment; a harness-built request that embeds the source does.
+# The client seam is bytes-in/bytes-out — never a host path — so it cannot read the host filesystem.
+# CLAIM SCOPE (Board-held): the harness BUILT a canonical request embedding the sealed source
+# and digested it, and the client seam is bytes-in/response-out with no host-fs access. It does NOT
+# claim the client TRANSMITTED those bytes verbatim (that is the Step-3 provider-gate, unbuilt) nor
+# that the model "saw it and nothing else". Containment is end-to-end ONLY once the provider-gate
+# lands. The reviewer is a MEASUREMENT, not a boundary.
 
 
 @dataclass(frozen=True)
 class ReviewOutcome:
-    """What the reviewer client actually did: the structured verdict plus the EXACT request/response
-    bytes it sent/received (digested into the receipt) and the provider/model identity. The stage
-    trusts none of it as a security signal — it records a measurement."""
+    """What the reviewer client returned: the structured verdict, the provider/model identity, and
+    the raw response bytes (digested into the receipt, never stored). The client does NOT supply the
+    request — the stage builds it (containment is structural, not the client's word) — so a fooled
+    or hallucinated verdict is a measurement error, never a breach."""
 
     verdict: str            # 'approve' | 'request_changes' (schema-validated at receipt build)
     provider_id: str
     model_id: str
-    raw_request: bytes      # the exact bytes sent to the reviewer (digested, not stored)
     raw_response: bytes     # the exact bytes received from the reviewer (digested, not stored)
 
 
-# A review client: (snapshot, reviewer_lineage, review_prompt_hash) -> ReviewOutcome. Injected so B1
-# can drive it manually / with a deterministic fake; a real client calls the reviewer model.
-ReviewClient = Callable[[Path, str, str], ReviewOutcome]
+# A review client: (request_bytes, reviewer_lineage, review_prompt_hash) -> ReviewOutcome. Handed
+# EXACT request bytes the stage built (embedding the sealed source), never a host path. Injected so
+# B1 can drive it manually / with a deterministic fake; a real client is a completion-only egress
+# that transmits request_bytes verbatim (see the provider-gate ReviewClient).
+ReviewClient = Callable[[bytes, str, str], ReviewOutcome]
+
+
+def _canonical_review_request(
+    source_bytes: bytes, reviewer_lineage: str, review_prompt_hash: str
+) -> bytes:
+    """Build the canonical review REQUEST envelope — a versioned, domain-separated document that
+    EMBEDS the sealed source bytes (base64). ``request_digest`` = sha256 of THESE bytes, so the
+    receipt's containment claim is structural: the harness built the request, and a client cannot
+    substitute a different body and still match the bound digest (consult P1 fold)."""
+    from core.chain import canonical_bytes
+    return canonical_bytes("gated-uat.review-request", {
+        "review_prompt_hash": review_prompt_hash,
+        "reviewer_lineage": reviewer_lineage,
+        "source_b64": base64.b64encode(source_bytes).decode("ascii"),
+    })
 
 
 def llm_review_stage(
-    view: Path,
+    sealed: SealedArtifact,
     *,
     reviewer_lineage: str,
     review_prompt_hash: str,
     review_client: ReviewClient,
 ) -> StageObservation:
-    """Run the cross-lineage LLM review over the materialised view and record the measurement.
-    ``outcome`` = pass iff the verdict is exactly ``approve``. The request/response are digested
-    (never stored); the provider/model id is recorded. Measurement, not security."""
-    result = review_client(view, reviewer_lineage, review_prompt_hash)
-    request_digest = hashlib.sha256(result.raw_request).hexdigest()
+    """Serialise the sealed artifact to canonical source bytes (self-checked to reconstruct the
+    sealed digest), BUILD the canonical request envelope embedding that source, hand the exact
+    request bytes to the (bytes-in/response-out) review client, and record it. ``outcome`` =
+    pass iff the verdict is exactly ``approve``. Binds ``source_digest`` (the sealed source) and
+    ``request_digest`` (the harness-built request EMBEDS the source — containment is structural)
+    + ``response_digest``. Measurement, not security."""
+    source_bytes = canonical_review_source(sealed)
+    source_digest = hashlib.sha256(source_bytes).hexdigest()
+    request_bytes = _canonical_review_request(source_bytes, reviewer_lineage, review_prompt_hash)
+    request_digest = hashlib.sha256(request_bytes).hexdigest()
+    result = review_client(request_bytes, reviewer_lineage, review_prompt_hash)
     response_digest = hashlib.sha256(result.raw_response).hexdigest()
     outcome = "pass" if result.verdict == "approve" else "fail"
     return StageObservation(
@@ -632,6 +696,7 @@ def llm_review_stage(
             "provider_id": result.provider_id,
             "model_id": result.model_id,
             "review_prompt_hash": review_prompt_hash,
+            "source_digest": source_digest,
             "request_digest": request_digest,
             "response_digest": response_digest,
             "verdict": result.verdict,
@@ -643,27 +708,19 @@ def llm_review_stage(
 # Stage: gate (the existing enforcement machinery) — P1: bind the tree the gate ACTUALLY measured
 # ------------------------------------------------------------------
 #
-# The gate is gated's REAL enforcement path (the pre-existing GatedEnforcementAdapter drives the
-# live
-# job runner). The consult's load-bearing P1 finding: the adapter selects + copies its OWN source
-# and
-# measures its OWN tree_hash at a source-selection seam, so a receipt that merely bound the cell's
-# expected digest could certify a DIFFERENT tree than the gate evaluated (a false green). The fix is
-# structural and made a SCHEMA LAW (schemas.validate_cell_stage_payload): the gate observation
-# carries
-# the digest the adapter ACTUALLY measured (``measured_tree_digest``), and the orchestrator refuses
-# to
-# sign unless it equals the cell's bound ``artifact_tree_digest`` — the gate may certify ONLY the
-# tree
-# it measured. Combined with assert_safe_artifact_tree (uniform symlink rejection), the two staging
-# paths cannot diverge and the source-selection false-green vector is closed.
+# The gate is gated's REAL enforcement path. The consult's load-bearing P1 finding: the adapter
+# selects + copies its OWN source and measures its OWN tree_hash at a source-selection seam, so a
+# receipt that merely bound the cell's expected digest could certify a DIFFERENT tree than the gate
+# evaluated (a false green). The fix is a SCHEMA LAW (schemas.validate_cell_stage_payload): the gate
+# observation carries the digest the adapter ACTUALLY measured (``measured_tree_digest``), and the
+# orchestrator refuses to sign unless it equals the cell's bound ``artifact_tree_digest``. The gate
+# receives a fresh extract_view of the sealed artifact.
 
 
 @dataclass(frozen=True)
 class GateMeasurement:
     """The gate's real projection, plus the digest it ACTUALLY measured. ``result_kind`` is a
-    VALID_RESULT_KINDS discriminator; ``admitted_outcome`` is 'pass'|'fail' for an admitted_run
-    (else
+    VALID_RESULT_KINDS discriminator; ``admitted_outcome`` is 'pass'|'fail' for admitted_run (else
     None); ``measured_tree_digest`` is the ``sha256:<hex>`` the enforcement adapter captured at its
     source-selection seam — the P1 anchor the cell outcome is only valid against."""
 
@@ -675,18 +732,19 @@ class GateMeasurement:
     measured_tree_digest: str
 
 
-# A gate runner: snapshot -> GateMeasurement. Injected so B1 can drive the real adapter at fanout /
-# a real-podman keystone, and unit-test the stage (incl. the P1 law) with a fake.
+# A gate runner: view -> GateMeasurement. Injected so B1 can drive the real adapter at fanout / a
+# real-podman keystone, and unit-test the stage (incl. the P1 law) with a fake.
 GateRunner = Callable[[Path], GateMeasurement]
 
-def gate_stage(view: Path, *, gate_runner: GateRunner) -> StageObservation:
-    """Run the artifact through the real gate and bind the digest the gate MEASURED. The cell
-    outcome
-    is DERIVED from ``result_kind`` (admitted->its verdict, blocking_refusal->blocked, else->error)
-    via the canonical schema map (schemas.GATE_CELL_OUTCOME_BY_KIND) — never taken on trust from the
-    runner. If the gate measured a different tree than the cell bound, the receipt is unsignable
+
+def gate_stage(sealed: SealedArtifact, *, gate_runner: GateRunner) -> StageObservation:
+    """Run the artifact through the real gate over a fresh extract_view and bind the digest the gate
+    MEASURED. The cell outcome is DERIVED from ``result_kind`` (admitted->its verdict,
+    blocking_refusal->blocked, else->error) via the canonical schema map — never taken on trust from
+    the runner. If the gate measured a different tree than the cell bound, the receipt is unsignable
     (P1)."""
-    m = gate_runner(view)
+    with extract_view(sealed) as view:
+        m = gate_runner(view)
     if m.result_kind == "admitted_run":
         outcome = m.admitted_outcome or "error"
     else:

@@ -258,3 +258,135 @@ def assert_stage_denominator_complete(
             parts.append(f"unknown stage: {sorted(unknown_stage)}")
         raise DenominatorIncompleteError(
             "stage denominator is not complete — refusing to render. " + "; ".join(parts))
+
+
+# ------------------------------------------------------------------
+# B1 step 4 — the board RENDER / ADMISSION gate (Gate 3)
+# ------------------------------------------------------------------
+#
+# The composing entrypoint that turns the building blocks above into a fail-closed admission
+# decision. It seals two properties at RENDER time, from SIGNED material only (never a driver's
+# runtime wiring — trust ends at the seam you don't own):
+#   * render-requires-pin — the signed manifest (and thus its signed toolchain env_digest) MUST
+#     verify before a board can render.
+#   * toolchain pin — every MEASURED static receipt ran under the exact signed manifest env_digest,
+#     so an operator cannot silently swap the analyser (dissent gap 4) — enforced independently of
+#     the static stage's own runtime assertion.
+
+# Mirrors gauntlet.CELL_STAGE_KIND. Kept LOCAL so the render gate does not import gauntlet's heavy
+# sandbox/gate dependencies; a parity test (test_board_render) binds the two so this cannot drift.
+CELL_STAGE_KIND = "cell_stage"
+_STATIC_STAGE = "static"
+
+
+class BoardRenderError(ValueError):
+    """The board is inadmissible — refusing to render (fail-closed). Base of the render-gate errors
+    (``assert_stage_denominator_complete`` raises the sibling ``DenominatorIncompleteError``)."""
+
+
+class AnchorMismatchError(BoardRenderError):
+    """A cell_stage receipt is anchored (``manifest_digest``) to a DIFFERENT board than the one
+    being rendered — a receipt minted against another manifest cannot be admitted here."""
+
+
+class ToolchainPinMismatchError(BoardRenderError):
+    """A MEASURED static receipt's ``env_digest`` != the signed manifest toolchain pin — the
+    analyser was (or could have been) swapped; the board MUST NOT render (dissent gap 4, Gate 3)."""
+
+
+def _verify_cell_stage_receipt(receipt: Receipt, verify_key: VerifyKey) -> dict[str, Any]:
+    """Verify ONE cell_stage receipt standalone: kind, digest recompute, Ed25519 signature, schema —
+    the same fail-closed shape as ``verify_manifest`` / ``evidence._verify_one``. The kind check is
+    symmetric: a manifest receipt passed here fails it, and a cell_stage passed to
+    ``verify_manifest`` fails there (kind is domain-separated INTO the digest, so a cross-kind swap
+    ALSO fails the digest recompute). Returns the payload. Fail-closed."""
+    if receipt.kind != CELL_STAGE_KIND:
+        raise BoardRenderError(f"expected a {CELL_STAGE_KIND!r} receipt, got {receipt.kind!r}")
+    domain = f"{DOMAIN_PREFIX}-{receipt.kind}"
+    try:
+        expected = canonical_digest(
+            domain,
+            canonical_envelope(receipt.kind, receipt.run_id, receipt.payload),
+            version=CANONICAL_DIGEST_VERSION,
+        )
+    except Exception as exc:  # noqa: BLE001 — any digest error is a fail-closed render refusal
+        raise BoardRenderError("error recomputing cell_stage digest") from exc
+    if receipt.digest != expected:
+        raise BoardRenderError(
+            f"cell_stage digest mismatch: stored={receipt.digest!r} recomputed={expected!r}")
+    try:
+        verify_receipt_sig(receipt.kind, receipt.digest, receipt.signature, verify_key)
+    except BadSignatureError as exc:
+        raise BoardRenderError("cell_stage signature invalid") from exc
+    try:
+        validate_payload(receipt.kind, receipt.payload)
+    except SchemaViolationError as exc:
+        raise BoardRenderError(f"cell_stage schema violation: {exc}") from exc
+    return receipt.payload
+
+
+def assert_board_admissible(
+    manifest_receipt: Receipt,
+    cell_stage_receipts: list[Receipt],
+    verify_key: VerifyKey,
+) -> dict[str, Any]:
+    """THE RENDER GATE (B1 step 4). Return the verified manifest payload iff the board is
+    admissible; fail-closed otherwise (a ``ManifestVerificationError`` / ``BoardRenderError``
+    subclass / ``DenominatorIncompleteError``). Trusts ONLY signed material — the manifest receipt
+    and the cell_stage receipts — never a driver's runtime wiring.
+
+      1. RENDER-REQUIRES-PIN — ``verify_manifest`` (signature + digest + schema). The verified
+         manifest carries the signed ``toolchain.env_digest``; a manifest that did not commit the
+         pin cannot pass schema, so it cannot reach a successful render.
+      2. Verify EACH cell_stage receipt standalone (kind / digest / signature / schema) — a forged,
+         tampered, foreign-key-signed, or wrong-kind receipt is refused.
+      3. ANCHOR BINDING — every receipt's ``manifest_digest`` == this manifest receipt's digest; a
+         receipt minted against a DIFFERENT board cannot be admitted here.
+      4. DENOMINATOR BIJECTION — exactly one terminal receipt per (planned_run_id × gauntlet stage):
+         no missing stage, no duplicate ``(run_id, stage)``, no unplanned run_id, no unknown stage —
+         cherry-picking and duplicate-swap are unrepresentable. Run FIRST, so the pin loop below
+         sees exactly one static receipt per planned cell.
+      5. TOOLCHAIN PIN — every MEASURED static receipt's ``observation.env_digest`` == the signed
+         manifest ``toolchain.env_digest`` (an operator cannot silently swap the analyser). A static
+         ERROR row (``{"harness_error": ...}``, outcome=error) recorded NO toolchain measurement, so
+         there is nothing to cross-check — and it is not a green cell, so it cannot smuggle a pass.
+         A PASS static receipt STRUCTURALLY carries ``env_digest`` (schema exact-key-set), so a
+         green static cell is ALWAYS checked; no representable green static receipt lacks it.
+
+    ``verify_key`` is the EXTERNAL trust anchor (the ``EvidenceSigner`` key supplied out-of-band by
+    whoever renders) — deliberately NOT read from the signed manifest, which would be
+    self-certifying (a forged manifest could designate its own verifier). Mirrors the evidence
+    system.
+    """
+    manifest_payload = verify_manifest(manifest_receipt, verify_key)
+    anchor = manifest_receipt.digest
+
+    stage_pairs: list[tuple[str, str]] = []
+    for receipt in cell_stage_receipts:
+        payload = _verify_cell_stage_receipt(receipt, verify_key)
+        if payload["manifest_digest"] != anchor:
+            raise AnchorMismatchError(
+                f"cell_stage receipt {receipt.run_id!r}/{payload['stage']!r} is anchored to "
+                f"{payload['manifest_digest']!r}, not this board {anchor!r}")
+        stage_pairs.append((receipt.run_id, str(payload["stage"])))
+
+    # exact bijection FIRST — a duplicate / unplanned / missing / unknown-stage board refuses before
+    # the pin cross-check, so the pin loop iterates exactly one static receipt per planned cell.
+    assert_stage_denominator_complete(manifest_payload, stage_pairs)
+
+    pin = manifest_payload["toolchain"]["env_digest"]
+    for receipt in cell_stage_receipts:
+        payload = receipt.payload
+        if payload["stage"] != _STATIC_STAGE:
+            continue
+        obs = payload["observation"]
+        if set(obs) == {"harness_error"}:
+            # an ERROR static row measured no toolchain (outcome=error, not a green cell): nothing
+            # to cross-check, and it cannot smuggle a pass (see docstring step 5).
+            continue
+        observed = obs["env_digest"]
+        if observed != pin:
+            raise ToolchainPinMismatchError(
+                f"static receipt {receipt.run_id!r} ran under env_digest {observed!r}, not the "
+                f"signed manifest toolchain pin {pin!r} — refusing to render (analyser swap)")
+    return manifest_payload
