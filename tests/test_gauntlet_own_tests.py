@@ -14,15 +14,16 @@ test_oci_sandbox.py; here we prove the STAGE logic over an injected fake sandbox
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
-from core import ExecutionResult, IsolationLevel
+from core import ExecutionResult, IsolationLevel, tree_hash
 
 from orchestrator.gauntlet import (
     CellContext,
-    immutable_snapshot,
     own_tests_stage,
     run_stage,
+    seal_artifact,
 )
 from orchestrator.schemas import validate_payload
 from orchestrator.trust import generate_signer
@@ -79,9 +80,10 @@ class _FakeSandbox:
         self.torn_down = True
 
 
-def _snap(tmp_path: Path):  # noqa: ANN202 — test helper
+@contextlib.contextmanager
+def _snap(tmp_path: Path):  # noqa: ANN202 — test helper: a view dir + its digest
     (tmp_path / "main.py").write_text("x = 1\n")
-    return immutable_snapshot(tmp_path)
+    yield tmp_path, tree_hash(tmp_path)
 
 
 def test_exit0_is_pass_the_thesis(tmp_path: Path) -> None:
@@ -147,10 +149,11 @@ def test_pytest_argv_is_hermetic_shape(tmp_path: Path) -> None:
 
 def test_receipt_integration_and_hermetic_law(tmp_path: Path) -> None:
     s = generate_signer()
-    with _snap(tmp_path) as (snap, digest):
+    (tmp_path / "main.py").write_text("x = 1\n")
+    with seal_artifact(tmp_path) as sealed:
         # a hermetic sandbox -> a valid signed own_tests receipt
         good = _FakeSandbox(outcome="completed", exit_code=0)
-        r = run_stage(_cell(), snap, digest, "own_tests",
+        r = run_stage(_cell(), sealed, sealed.digest, "own_tests",
                       lambda p: own_tests_stage(p, image="img", make_sandbox=lambda: good),
                       s.signing_key)
         assert r.payload["stage"] == "own_tests"
@@ -160,7 +163,7 @@ def test_receipt_integration_and_hermetic_law(tmp_path: Path) -> None:
         # a NON-hermetic sandbox -> the isolation law rejects the receipt -> published ERROR
         weak = _FakeSandbox(outcome="completed", exit_code=0,
                             isolation_level=IsolationLevel.WEAK)
-        r2 = run_stage(_cell(), snap, digest, "own_tests",
+        r2 = run_stage(_cell(), sealed, sealed.digest, "own_tests",
                        lambda p: own_tests_stage(p, image="img", make_sandbox=lambda: weak),
                        s.signing_key)
         assert r2.payload["outcome"] == "error"
