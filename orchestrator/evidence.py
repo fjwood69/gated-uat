@@ -324,8 +324,15 @@ def validate_semantic_continuity(
             raise SemanticContinuityError(
                 f"event_digest {xp.get('event_digest')!r} != prereg.rc_event_digest "
                 f"{ep.get('rc_event_digest')!r} — the run was rebound to a different event")
-        # a captured plan (present unless non_run) is for the configured policy.
-        ppid = xp.get("plan_policy_id")
+        # a captured plan (present unless non_run) is for the configured policy. UAT-1 belt: the v3
+        # schema requires plan_policy_id PRESENT (explicit null iff non_run); fail closed if a
+        # future schema regression drops it, not silently .get→None and skip the plan-binding
+        # comparison (the exact bug UAT-1 closed at the schema layer — defence in depth here).
+        if "plan_policy_id" not in xp:
+            raise SemanticContinuityError(
+                "plan_policy_id absent from a v3 execution — schema regression; continuity cannot "
+                "verify plan binding (fail-closed)")
+        ppid = xp["plan_policy_id"]
         if ppid is not None and ppid != cfg:
             raise SemanticContinuityError(
                 f"plan_policy_id {ppid!r} != configured_policy_id {cfg!r} — plan "
