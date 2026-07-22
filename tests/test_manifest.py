@@ -11,6 +11,7 @@ Proves the three ratified amendments are STRUCTURAL:
 from __future__ import annotations
 
 import copy
+import uuid
 from datetime import datetime, timezone
 
 import pytest
@@ -225,3 +226,30 @@ def test_stage_denominator_rejects_four_identical_run_ids_naively() -> None:
     rid = sorted(planned_run_ids(vp))[0]
     with pytest.raises(DenominatorIncompleteError):
         assert_denominator_complete(vp, [rid, rid, rid, rid])
+
+
+# ---- B1-2: mint-time denominator completeness (task ⊆ cells + full task×lineage product) ----
+
+def _bare_cell(task_id: str, lineage: str, side: str, reviewer: str, rep: int = 0) -> dict:
+    return {"cell_id": f"{task_id}/{lineage}/{rep}", "task_id": task_id, "lineage": lineage,
+            "side": side, "replicate": rep, "planned_run_id": str(uuid.uuid4()),
+            "reviewer_lineage": reviewer}
+
+
+def test_orphan_declared_task_rejected() -> None:
+    # B1-2: a task DECLARED in tasks[] but given NO cells is unsignable — the board advertises a
+    # task it never runs (the "100 hard / 10 trivial" cherry-pick). Enforced at mint, not render.
+    tasks = _tasks()  # retry-swallow (tempting) + retry-clean (clean)
+    only_first = plan_cells([(tasks[0]["task_id"], tasks[0]["side"])], _LINEAGES, 2)
+    with pytest.raises(SchemaViolationError):
+        validate_payload("manifest", _payload(tasks=tasks, cells=only_first))
+
+
+def test_asymmetric_lineage_coverage_rejected() -> None:
+    # B1-2: both tasks present, but task A only on lineage X and task B only on lineage Y — the
+    # (task × lineage) product is incomplete ((A,Y),(B,X) missing). Unsignable.
+    tasks = _tasks()
+    cells = [_bare_cell(tasks[0]["task_id"], "claude-x", tasks[0]["side"], "gpt-y"),
+             _bare_cell(tasks[1]["task_id"], "gpt-y", tasks[1]["side"], "claude-x")]
+    with pytest.raises(SchemaViolationError):
+        validate_payload("manifest", _payload(tasks=tasks, denom=_denom(1), cells=cells, n=1))
