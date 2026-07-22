@@ -315,8 +315,16 @@ _MANIFEST_KEYS: frozenset[str] = frozenset(
         "tasks",              # task specs (prompt+hash, invariant, gauntlet, side)
         "denominator",        # n_replicates, seed, temperature, params, retry, infra
         "cells",              # the COMPLETE ORDERED list of planned cells (the denominator)
+        "toolchain",          # the SIGNED static-toolchain pin (dissent gap 4) — committed here
     }
 )
+# The static toolchain pinned IN the signed manifest (dissent gap 4): the render + the static stage
+# enforce against THIS, so an operator cannot silently swap the analyser. env_digest is the
+# authoritative environment coordinate (e.g. the dependency-lock digest or the pinned OCI image id);
+# the wrapper-executable sha is a shim, not the imported code — so env_digest is the pin
+# and the version strings are descriptive.
+_TOOLCHAIN_KEYS: frozenset[str] = frozenset(
+    {"python_version", "ruff_version", "mypy_version", "env_digest"})
 _TASK_KEYS: frozenset[str] = frozenset(
     {
         "task_id",
@@ -388,6 +396,12 @@ GATE_OUTCOME_BY_RESULT_KIND: dict[str, frozenset[str | None]] = {
     "blocking_refusal": frozenset({"run_verdict"}),
     "non_run": frozenset({"block_gate", "neutral_gate"}),
     "infrastructure_failure": frozenset({None}),
+}
+# non_run binds TIGHTER than the kind: the disposition (== result_reason) FIXES the gate_outcome —
+# a non_run may not pair either way (gap 3). == gate.job_result.account() over NonRunDecision.
+NON_RUN_GATE_OUTCOME_BY_REASON: dict[str, str] = {
+    "block_action_required": "block_gate",
+    "skip_neutral": "neutral_gate",
 }
 
 
@@ -1016,6 +1030,17 @@ def _validate_denominator(denom: dict[str, Any]) -> int:
     return int(n)
 
 
+def _validate_toolchain(tc: dict[str, Any]) -> None:
+    """The signed static-toolchain pin (dissent gap 4). env_digest is the AUTHORITATIVE coordinate
+    (dependency-lock digest or pinned OCI image id, ``sha256:<hex64>``); the version strings are
+    descriptive. Committed in the manifest so the static stage + the render enforce against it."""
+    _check_exact_keys(tc, _TOOLCHAIN_KEYS, "toolchain")
+    for k in ("python_version", "ruff_version", "mypy_version"):
+        if not _require(tc, k, types=(str,)):
+            raise SchemaViolationError(f"toolchain.{k}: must be non-empty")
+    _require_sha256_prefixed(tc, "env_digest")
+
+
 def validate_manifest_payload(payload: dict[str, Any]) -> None:
     """Validate a B1 board-manifest receipt payload — the anchored, complete-denominator board
     preregistration. Integrity checks that make the ratified amendments true-by-construction:
@@ -1054,6 +1079,8 @@ def validate_manifest_payload(payload: dict[str, Any]) -> None:
 
     denom = _require(payload, "denominator", types=(dict,))
     n_replicates = _validate_denominator(denom)
+
+    _validate_toolchain(_require(payload, "toolchain", types=(dict,)))
 
     cells = _require(payload, "cells", types=(list,))
     if not cells:
@@ -1199,22 +1226,31 @@ def _validate_cell_observation(
         if result_kind not in VALID_RESULT_KINDS:
             raise SchemaViolationError(
                 f"observation.result_kind: must be one of {sorted(VALID_RESULT_KINDS)}")
-        _require(obs, "result_reason", types=(str,))
+        result_reason = _require(obs, "result_reason", types=(str,))
         _require(obs, "result_sub_reason", types=(str,))
         gate_outcome = obs["gate_outcome"]  # str in set, or null for an infra row (no gate outcome)
         if gate_outcome is not None and gate_outcome not in VALID_GATE_OUTCOMES:
             raise SchemaViolationError(
                 f"observation.gate_outcome: must be null or one of {sorted(VALID_GATE_OUTCOMES)}")
-        # COHERENCE LAW (== gate.job_result.account(), parity-tested): the gate_outcome a
-        # result_kind
-        # can carry is fixed — e.g. a blocking_refusal is run_verdict (a real admission verdict),
-        # NOT
+        # COHERENCE LAW (== account(), parity-tested): the gate_outcome a result_kind
+        # can carry is fixed — a blocking_refusal is run_verdict (a real admission verdict), NOT
         # block_gate; an infra row carries NO gate outcome.
         if gate_outcome not in GATE_OUTCOME_BY_RESULT_KIND[result_kind]:
             raise SchemaViolationError(
                 f"gate_outcome {gate_outcome!r} incoherent with result_kind {result_kind!r} "
                 "(account() permits "
                 f"{sorted(str(x) for x in GATE_OUTCOME_BY_RESULT_KIND[result_kind])})")
+        # non_run binds TIGHTER (gap 3): the disposition (result_reason) FIXES block vs neutral.
+        if result_kind == "non_run":
+            want = NON_RUN_GATE_OUTCOME_BY_REASON.get(result_reason)
+            if want is None:
+                raise SchemaViolationError(
+                    f"non_run result_reason {result_reason!r} must be one of "
+                    f"{sorted(NON_RUN_GATE_OUTCOME_BY_REASON)}")
+            if gate_outcome != want:
+                raise SchemaViolationError(
+                    f"non_run gate_outcome {gate_outcome!r} incoherent with disposition "
+                    f"{result_reason!r} — account() fixes it to {want!r}")
         measured = _require_sha256_prefixed(obs, "measured_tree_digest")
         # ---- P1 SCHEMA LAW: the gate measured the tree the cell bound, or it cannot sign. --------
         if measured != artifact_tree_digest:

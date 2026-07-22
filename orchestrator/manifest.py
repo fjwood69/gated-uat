@@ -43,7 +43,7 @@ from .evidence import (
     build_receipt,
     canonical_envelope,
 )
-from .schemas import SchemaViolationError, validate_payload
+from .schemas import VALID_STAGES, SchemaViolationError, validate_payload
 from .trust import BadSignatureError, verify_receipt_sig
 
 MANIFEST_KIND = "manifest"
@@ -110,9 +110,11 @@ def build_manifest_payload(
     tasks: list[dict[str, Any]],
     denominator: dict[str, Any],
     cells: list[dict[str, Any]],
+    toolchain: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble the board-manifest payload dict (validated by schemas.validate_manifest_payload at
-    build time). Kept schema-shaped (a plain dict) to reuse the receipt machinery verbatim."""
+    build time). Kept schema-shaped (a plain dict) to reuse the receipt machinery verbatim.
+    ``toolchain`` is the SIGNED static-toolchain pin (dissent gap 4) — required, never defaulted."""
     return {
         "schema_version": 1,
         "manifest_version": BOARD_MANIFEST_VERSION,
@@ -123,6 +125,7 @@ def build_manifest_payload(
         "tasks": tasks,
         "denominator": denominator,
         "cells": cells,
+        "toolchain": toolchain,
     }
 
 
@@ -210,3 +213,48 @@ def assert_denominator_complete(
             parts.append(f"duplicate terminal receipts: {sorted(duplicates)}")
         raise DenominatorIncompleteError(
             "board denominator is not complete — refusing to render. " + "; ".join(parts))
+
+
+def assert_stage_denominator_complete(
+    manifest_payload: dict[str, Any],
+    terminal_stage_receipts: list[tuple[str, str]],
+) -> None:
+    """RENDER GATE for the step-2 cell_stage model (dissent gap 5). Each cell emits ONE receipt PER
+    STAGE that shares the cell's ``planned_run_id``, so the denominator is the CROSS-PRODUCT
+    (planned_run_id x gauntlet stage), NOT one receipt per run_id. A board renders ONLY when, for
+    EVERY planned cell, EXACTLY the full set of stages is present — no missing stage, no duplicate
+    (run_id, stage), no unplanned run_id, no unknown stage. ``terminal_stage_receipts`` is the list
+    of ``(run_id, stage)`` pairs of the terminal cell_stage receipts. Passing four identical run_ids
+    to the per-cell ``assert_denominator_complete`` would (correctly) look like duplicates; THIS is
+    the gate for cell_stage receipts."""
+    planned = planned_run_ids(manifest_payload)
+    stages = frozenset(VALID_STAGES)
+    seen: dict[str, set[str]] = {}
+    duplicates: set[tuple[str, str]] = set()
+    unplanned: set[tuple[str, str]] = set()
+    unknown_stage: set[tuple[str, str]] = set()
+    for rid_raw, stage_raw in terminal_stage_receipts:
+        rid, stage = str(rid_raw), str(stage_raw)
+        if stage not in stages:
+            unknown_stage.add((rid, stage))
+            continue
+        if rid not in planned:
+            unplanned.add((rid, stage))
+            continue
+        cell_stages = seen.setdefault(rid, set())
+        if stage in cell_stages:
+            duplicates.add((rid, stage))
+        cell_stages.add(stage)
+    missing = {(rid, st) for rid in planned for st in stages if st not in seen.get(rid, set())}
+    if missing or unplanned or duplicates or unknown_stage:
+        parts = []
+        if missing:
+            parts.append(f"missing (run_id,stage): {sorted(missing)}")
+        if unplanned:
+            parts.append(f"unplanned run_id: {sorted(unplanned)}")
+        if duplicates:
+            parts.append(f"duplicate (run_id,stage): {sorted(duplicates)}")
+        if unknown_stage:
+            parts.append(f"unknown stage: {sorted(unknown_stage)}")
+        raise DenominatorIncompleteError(
+            "stage denominator is not complete — refusing to render. " + "; ".join(parts))
