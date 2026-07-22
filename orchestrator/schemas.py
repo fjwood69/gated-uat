@@ -369,8 +369,9 @@ VALID_STAGES: frozenset[str] = frozenset({"static", "own_tests", "llm_review", "
 # demonstration row (green-green-green-BLOCKED) and is VALID ONLY on the ``gate`` stage.
 VALID_CELL_OUTCOMES: frozenset[str] = frozenset({"pass", "fail", "error", "blocked"})
 # Reserved sentinel bound on a cell-level ERROR receipt when the artifact could NOT be safely
-# materialised or hashed. A sha256 preimage of all-zeros is cryptographically impossible, so it can
-# never collide with a real tree_hash; the sentinel schema law forces outcome=error + harness_error.
+# materialised or hashed. All-zeros is not a mathematically impossible sha256 output — it is a
+# RESERVED value made UNREACHABLE for a normal receipt BY SCHEMA LAW (the sentinel law below forces
+# outcome=error + harness_error), never by cryptographic accident.
 UNMEASURABLE_TREE_DIGEST: str = "sha256:" + "0" * 64
 # Own-tests pytest status (derived OUT-OF-BAND from the container exit code, never producer output).
 VALID_PYTEST_STATUS: frozenset[str] = frozenset({"passed", "failed", "no_tests", "error"})

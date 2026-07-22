@@ -67,8 +67,8 @@ CELL_STAGE_KIND = "cell_stage"
 # The ratified ordered gauntlet (build order == run order).
 GAUNTLET_STAGES: tuple[str, ...] = ("static", "own_tests", "llm_review", "gate")
 # The reserved sentinel bound on a cell-level ERROR receipt when the artifact could NOT be safely
-# materialised or hashed. Canonical in schemas; the sentinel schema law forces outcome=error +
-# harness_error, so it can never sign a PASS/FAIL/BLOCKED.
+# materialised or hashed. Canonical in schemas; a RESERVED value made unreachable for a normal
+# receipt by the sentinel schema law (forces outcome=error + harness_error), not by crypto accident.
 UNMEASURABLE_DIGEST = UNMEASURABLE_TREE_DIGEST
 
 
