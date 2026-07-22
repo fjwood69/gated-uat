@@ -365,6 +365,38 @@ VALID_PYTEST_STATUS: frozenset[str] = frozenset({"passed", "failed", "no_tests",
 # LLM reviewer's structured verdict (measurement, not a security boundary): strict approve → PASS.
 VALID_REVIEW_VERDICTS: frozenset[str] = frozenset({"approve", "request_changes"})
 
+# --- CANONICAL stage outcome maps (single source; orchestrator.gauntlet imports these) ------------
+# Coherence is SCHEMA LAW on EVERY stage, not just the gate — a signed receipt whose outcome does
+# not
+# match its observed measurement is unrepresentable (swept across all four producers, not one).
+# own_tests: the OUT-OF-BAND container exit code fixes the status; the status fixes the cell
+# outcome.
+PYTEST_STATUS_BY_EXIT: dict[int, str] = {0: "passed", 1: "failed", 5: "no_tests"}
+OWN_TESTS_CELL_OUTCOME: dict[str, str] = {
+    "passed": "pass", "failed": "fail", "no_tests": "error", "error": "error"}
+# gate: the cell outcome for a non-admitted kind (admitted -> its own verdict pass|fail).
+GATE_CELL_OUTCOME_BY_KIND: dict[str, str] = {
+    "blocking_refusal": "blocked", "non_run": "error", "infrastructure_failure": "error"}
+# gate: the account()-COHERENT gate_outcome per result_kind. The schema cannot import gated, so this
+# re-encodes gate.job_result.account(); tests/test_gauntlet_coherence.py binds it to the REAL
+# account() output (a parity test) so the re-encoding cannot silently drift (unbound-reader guard).
+# NB (dissent catch): a BlockingRefusal carries gate_outcome=run_verdict (a real admission verdict
+# was
+# produced), NOT block_gate.
+GATE_OUTCOME_BY_RESULT_KIND: dict[str, frozenset[str | None]] = {
+    "admitted_run": frozenset({"run_verdict"}),
+    "blocking_refusal": frozenset({"run_verdict"}),
+    "non_run": frozenset({"block_gate", "neutral_gate"}),
+    "infrastructure_failure": frozenset({None}),
+}
+
+
+def expected_pytest_status(container_exit_code: int | None) -> str:
+    """The pytest status the OUT-OF-BAND container exit code fixes (null -> error)."""
+    if container_exit_code is None:
+        return "error"
+    return PYTEST_STATUS_BY_EXIT.get(container_exit_code, "error")
+
 _CELL_STAGE_KEYS: frozenset[str] = frozenset(
     {
         "schema_version",
@@ -1097,10 +1129,20 @@ def _validate_cell_observation(
     _check_exact_keys(obs, _OBS_KEYS_BY_STAGE[stage], f"observation[{stage}]")
     if stage == "static":
         _require(obs, "tool_versions", types=(dict,))
-        _require(obs, "ruff_exit", types=(int,))
-        _require(obs, "mypy_exit", types=(int,))
+        ruff_exit = _require(obs, "ruff_exit", types=(int,))
+        mypy_exit = _require(obs, "mypy_exit", types=(int,))
         if _require(obs, "findings_count", types=(int,)) < 0:
             raise SchemaViolationError("observation.findings_count: must be >= 0")
+        # COHERENCE LAW: a measured static run is pass iff BOTH tools exited 0 (else fail); an error
+        # is only ever the harness_error path above.
+        if outcome not in ("pass", "fail"):
+            raise SchemaViolationError(
+                f"static outcome must be pass|fail (measured), got {outcome!r}")
+        expected = "pass" if (ruff_exit == 0 and mypy_exit == 0) else "fail"
+        if outcome != expected:
+            raise SchemaViolationError(
+                f"static outcome {outcome!r} incoherent with exits (ruff={ruff_exit}, "
+                f"mypy={mypy_exit}) — must be {expected!r} (a non-zero exit cannot sign 'pass')")
     elif stage == "own_tests":
         level = _require(obs, "sandbox_isolation_level", types=(str,))
         if level != "hermetic":
@@ -1119,6 +1161,18 @@ def _validate_cell_observation(
         if status not in VALID_PYTEST_STATUS:
             raise SchemaViolationError(
                 f"observation.pytest_status: must be one of {sorted(VALID_PYTEST_STATUS)}")
+        # COHERENCE LAW: the exit code fixes the status, the status fixes the outcome — a receipt
+        # with
+        # exit_code=1/pytest_status=passed (or status/outcome disagreeing) is unrepresentable.
+        want_status = expected_pytest_status(cec)
+        if status != want_status:
+            raise SchemaViolationError(
+                f"pytest_status {status!r} incoherent with container_exit_code {cec!r} "
+                f"(the out-of-band exit fixes status={want_status!r})")
+        if outcome != OWN_TESTS_CELL_OUTCOME[status]:
+            raise SchemaViolationError(
+                f"own_tests outcome {outcome!r} incoherent with pytest_status {status!r} "
+                f"(must be {OWN_TESTS_CELL_OUTCOME[status]!r})")
     elif stage == "llm_review":
         if not _require(obs, "provider_id", types=(str,)):
             raise SchemaViolationError("observation.provider_id: must be non-empty")
@@ -1131,6 +1185,15 @@ def _validate_cell_observation(
         if verdict not in VALID_REVIEW_VERDICTS:
             raise SchemaViolationError(
                 f"observation.verdict: must be one of {sorted(VALID_REVIEW_VERDICTS)}")
+        # COHERENCE LAW: strict approve -> pass; anything else -> fail (the reviewer 'caught' it).
+        if outcome not in ("pass", "fail"):
+            raise SchemaViolationError(
+                f"llm_review outcome must be pass|fail (measured), got {outcome!r}")
+        expected_rv = "pass" if verdict == "approve" else "fail"
+        if outcome != expected_rv:
+            raise SchemaViolationError(
+                f"llm_review outcome {outcome!r} incoherent with verdict {verdict!r} "
+                f"(strict approve->pass; must be {expected_rv!r})")
     elif stage == "gate":
         result_kind = _require(obs, "result_kind", types=(str,))
         if result_kind not in VALID_RESULT_KINDS:
@@ -1142,6 +1205,16 @@ def _validate_cell_observation(
         if gate_outcome is not None and gate_outcome not in VALID_GATE_OUTCOMES:
             raise SchemaViolationError(
                 f"observation.gate_outcome: must be null or one of {sorted(VALID_GATE_OUTCOMES)}")
+        # COHERENCE LAW (== gate.job_result.account(), parity-tested): the gate_outcome a
+        # result_kind
+        # can carry is fixed — e.g. a blocking_refusal is run_verdict (a real admission verdict),
+        # NOT
+        # block_gate; an infra row carries NO gate outcome.
+        if gate_outcome not in GATE_OUTCOME_BY_RESULT_KIND[result_kind]:
+            raise SchemaViolationError(
+                f"gate_outcome {gate_outcome!r} incoherent with result_kind {result_kind!r} "
+                "(account() permits "
+                f"{sorted(str(x) for x in GATE_OUTCOME_BY_RESULT_KIND[result_kind])})")
         measured = _require_sha256_prefixed(obs, "measured_tree_digest")
         # ---- P1 SCHEMA LAW: the gate measured the tree the cell bound, or it cannot sign. --------
         if measured != artifact_tree_digest:
