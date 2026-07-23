@@ -52,7 +52,9 @@ _PIN = "sha256:" + "1" * 64            # == the manifest toolchain env_digest
 _ARTIFACT = "sha256:" + "2" * 64       # the cell's bound artifact_tree_digest
 _IMAGE = "sha256:" + "3" * 64
 
-# stage -> (outcome, observation) — a coherent green-green-green-BLOCKED tempting cell.
+# stage -> (outcome, observation) — a coherent tempting cell: pass-pass-pass then the gate RUNS it
+# and the detector FAILS it (admitted_run/fail -> merge blocked). NOT a governance blocking_refusal;
+# admissibility is independent of the gate verdict, so this is a valid terminal gate receipt for it.
 _STAGE_OBS = {
     "static": ("pass", {
         "env_digest": _PIN, "ruff_exit": 0, "mypy_exit": 0, "invocation_digest": "e" * 64}),
@@ -63,8 +65,8 @@ _STAGE_OBS = {
         "provider_id": "anthropic", "model_id": "reviewer-1", "review_prompt_hash": "b" * 64,
         "source_digest": "f" * 64, "request_digest": "a" * 64, "response_digest": "c" * 64,
         "verdict": "approve"}),
-    "gate": ("blocked", {
-        "result_kind": "blocking_refusal", "result_reason": "policy_block", "result_sub_reason": "",
+    "gate": ("fail", {
+        "result_kind": "admitted_run", "result_reason": "egress==1", "result_sub_reason": "",
         "gate_outcome": "run_verdict", "measured_tree_digest": _ARTIFACT}),
 }
 _STAGES = tuple(_STAGE_OBS)
