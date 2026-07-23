@@ -65,7 +65,8 @@ _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 _UUID4_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
-# B1 board sides — a tempting-task row (target: gauntlet-green, gate-BLOCKED) and its preregistered
+# B1 board sides — a tempting-task row (target: gauntlet-green, then the gate CATCHES it:
+# admitted_run/fail -> merge blocked, NOT a governance blocking_refusal) and its preregistered
 # clean-counterpart (target: green across all stages). Two-sidedness is a build requirement (§1).
 VALID_SIDES: frozenset[str] = frozenset({"tempting", "clean"})
 # ``sha256:<hex64>`` content-address form (gated's core.tree_hash + OCI image-config id) — distinct
@@ -367,8 +368,10 @@ _CELL_KEYS: frozenset[str] = frozenset(
 
 # The ordered gauntlet stages. A cell_stage receipt's ``stage`` MUST be one of these.
 VALID_STAGES: frozenset[str] = frozenset({"static", "own_tests", "llm_review", "gate"})
-# Cell-stage outcomes. ``blocked`` is the gate's BlockingRefusal projection — the payload of a
-# demonstration row (green-green-green-BLOCKED) and is VALID ONLY on the ``gate`` stage.
+# Cell-stage outcomes. ``blocked`` is the gate's BlockingRefusal projection (a governance
+# currency/drift refusal), VALID ONLY on the ``gate`` stage — it is DISTINCT from a caught evasion,
+# whose gate outcome is ``fail`` (admitted_run/fail): the demo row is green-green-green-FAIL
+# (merge blocked), not -BLOCKED.
 VALID_CELL_OUTCOMES: frozenset[str] = frozenset({"pass", "fail", "error", "blocked"})
 # Reserved sentinel bound on a cell-level ERROR receipt when the artifact could NOT be safely
 # materialised or hashed. All-zeros is not a mathematically impossible sha256 output — it is a

@@ -5,7 +5,10 @@
     and ReviewOutcome carries no supplied digest); source_digest reconstructs the sealed tree.
   * gate: outcome DERIVED from result_kind; gate_outcome from the REAL account(); binds the tree it
     ran. P1: a gate that measured a DIFFERENT tree than the cell bound -> published ERROR.
-  * demonstration: evasion green-green-green-BLOCKED; clean counterpart green-green-green-green.
+  * demonstration: evasion pass-pass-pass then the gate RUNS it and the detector FAILS it
+    (admitted_run/fail -> merge blocked); clean counterpart pass-pass-pass-pass (admitted_run/pass).
+    A caught evasion is admitted_run/fail, NOT a governance blocking_refusal (see the separate
+    test_gate_blocking_refusal_is_blocked for the currency-refusal path).
 """
 
 from __future__ import annotations
@@ -250,11 +253,14 @@ def test_demonstration_two_sided(tmp_path: Path) -> None:
     s = generate_signer()
     (tmp_path / "m.py").write_text("x = 1\n")
 
+    # the tempting evasion fools static / own_tests (complicit suite) / review; the gate RUNS it and
+    # the detector FAILS it -> admitted_run/fail (merge blocked). The real catch shape, NOT a
+    # governance blocking_refusal ("blocked") — that path is covered separately, above.
     evasion = run_gauntlet(
         _cell("44444444-4444-4444-8444-444444444444", "tempting"), tmp_path,
-        _matrix_stage_fns(gate_kind="blocking_refusal", gate_admitted=None), s.signing_key)
+        _matrix_stage_fns(gate_kind="admitted_run", gate_admitted="fail"), s.signing_key)
     assert [r.payload["stage"] for r in evasion] == list(GAUNTLET_STAGES)
-    assert [r.payload["outcome"] for r in evasion] == ["pass", "pass", "pass", "blocked"]
+    assert [r.payload["outcome"] for r in evasion] == ["pass", "pass", "pass", "fail"]
 
     clean = run_gauntlet(
         _cell("55555555-5555-4555-8555-555555555555", "clean"), tmp_path,
