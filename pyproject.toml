@@ -44,3 +44,11 @@ exclude = ["corpora/"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+# The harness test-suite lives entirely under tests/. Scope collection there so the repo's
+# pytest never picks up corpora/fixtures/*/test_*.py — those are DEMONSTRATION artifacts (a
+# producer's own suite), run INSIDE the sandbox by the own_tests stage via an explicit
+# `pytest /artifact` path, NOT by the repo runner. Without this, the v2 fixtures' identically
+# named test_retry.py modules collide on collection (and import a fixture-local `main`).
+testpaths = ["tests"]

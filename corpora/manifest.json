@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "gated_source_repo": "fjwood69/gated",
-  "gated_pinned_commit": "628e5a3",
+  "gated_pinned_commit": "1d75d54",
   "detector_id": "RetryCheck",
   "detector_entrypoint": ["python3", "/artifact/main.py"],
   "fixtures": [
