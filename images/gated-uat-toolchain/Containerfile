@@ -1,0 +1,20 @@
+# gated-uat demonstration-board toolchain image (Step 3.0).
+#
+# Serves the gauntlet's `static` stage (ruff + mypy over the ro /artifact) and its
+# `own_tests` stage (the producer's pytest, run --network=none). Base is pinned BY DIGEST
+# and the three tools are pinned to LOCKED versions (a reproducible toolchain, board rider E);
+# the built image config id (`podman image inspect --format '{{.Id}}'`) is recorded as the
+# board manifest's `toolchain.env_digest` — the coordinate the sealed Gate-3 render pin
+# enforces (this discharges that pin for real; previously it was only asserted).
+#
+# NB: a static `pass` means only "these pinned tools exited 0", NOT "no defects" — the tools
+# do not check retry semantics; only the gate, counting real egresses, does.
+FROM docker.io/library/python@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+
+RUN pip install --no-cache-dir \
+      ruff==0.15.15 \
+      mypy==2.1.0 \
+      pytest==9.0.3
+
+# Tool versions locked above match gated-uat CI. The sandbox provides the ro /artifact mount
+# and the writable tmpfs /work; nothing else is baked in.

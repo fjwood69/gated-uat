@@ -9,11 +9,13 @@ any promotion decision is made.
 
 **Status:** Live-enforcement evidence (schema v3, provenance-typed) built. The **B1
 Demonstration Board apparatus** is MERGED (`c7f3c02`): the signed manifest + four-stage
-gauntlet + render/admission gate that *can produce* a signed gate demonstration. Scope it
-precisely — the board **machinery/spine** is merged, **not a demonstration that exists**:
-there are **no real rows yet** (the first populated row is the next increment). The
-render/admission gate (`assert_board_admissible`) is a proven **component** with **no
-production caller yet** — see **Caller-law** in the Demonstration Board section below.
+gauntlet + render/admission gate. **Step 3.1** adds the **render driver** (`render_board`) —
+the first production caller of `assert_board_admissible`, so the **caller-law is satisfied** —
+and the **first two-sided real row**, proven by a real-podman keystone: a tempting evasion
+passes static, own_tests and llm_review, then the gate runs it and the detector FAILs it
+(**ADMIT/fail** → the required check fails, merge blocked); its clean counterpart ends in
+**ADMIT**. Capture-record provenance is unsigned-in-B1 / optional. See **Caller-law** in the
+Demonstration Board section below.
 
 ---
 
@@ -41,8 +43,8 @@ correctly classify every fixture; a `FAIL` is valid signed evidence of a regress
 
 Beyond the calibration chain, `gated-uat` can produce a **demonstration board**: a
 preregistered, two-sided matrix of artifact rows × gauntlet stages — disclosure, not a
-ranking. **The apparatus is built and merged; it is not yet populated** — no real agent
-artifacts have been run through it (that is the next increment). What exists today:
+ranking. The apparatus is merged; **Step 3.1** adds the render driver and the **first
+two-sided row** through real components (a real-podman keystone). What exists today:
 
 - **Signed manifest (the prereg):** `build_manifest` commits the *complete ordered
   denominator* (every planned cell), the toolchain pin (`env_digest`), reviewer
@@ -50,11 +52,14 @@ artifacts have been run through it (that is the next increment). What exists tod
   (`manifest.py`).
 - **The gauntlet (per cell):** `static → own_tests → llm_review → gate`, each a signed
   `cell_stage` observation bound to the manifest anchor and one immutable artifact digest.
-  On the **tempting side**, the *intended* demonstration is **green-green-green-BLOCKED**:
-  the producer's own tests pass on an evasion (that is the thesis) and the gate BLOCKS it;
-  the clean-counterpart side is green across all stages. `static` + `own_tests` run in a
-  hermetic OCI sandbox (exit-code-only); the `gate` stage runs `gated`'s **real**
-  enforcement path.
+  On the **tempting** side, the intended demonstration is **green-green-green-ADMIT/fail**:
+  the producer's own tests pass on an evasion (the thesis); the gate **admits** the run under
+  a healthy ENABLED policy and the detector returns a **FAIL** run-verdict (`admitted_run` /
+  `run_verdict` / outcome `fail`) — so a required PR check fails and the merge is blocked. That
+  is **not** a governance `blocking_refusal` (rendered `BLOCKED`), which is reserved for
+  currency/drift refusals. The clean counterpart is green across all stages, ending in **ADMIT**.
+  `static` + `own_tests` run in a hermetic OCI sandbox (exit-code-only); the `gate` stage runs
+  `gated`'s **real** enforcement path.
 - **Capability-deletion, not policy:** the review client is transmit-only with a
   completion-path egress allowlist (`provider_gate.py`); each sandbox stage binds the
   *sealed* artifact digest through the pin's real `OCISandbox.prepare()` (drift →
@@ -66,10 +71,12 @@ artifacts have been run through it (that is the next increment). What exists tod
   receipt's `env_digest` **==** the signed manifest toolchain pin (an operator cannot
   silently swap the analyser).
 
-**Caller-law (honest scope).** `assert_board_admissible` is a proven gate **component** —
-it has **no production caller yet**. Any future render / UI / export path **must** call it
-before emitting board output. Nothing here claims the render pipeline enforces the pin
-end-to-end, nor that a populated demonstration exists — both are named follow-ons.
+**Caller-law (satisfied, Step 3.1).** `assert_board_admissible` now has its first production
+caller: `render_board` calls it BEFORE any emit (fail-closed — nothing is written until
+admission passes), and a real-podman keystone drives a populated two-sided board through it.
+Any OTHER render / UI / export path **must** likewise call it before emitting board output.
+Capture-record provenance is signed by the local render key only — optional, not part of
+admissibility, origin not gate-verified (see the board disclosure).
 
 ---
 
@@ -268,12 +275,12 @@ the sentinel object.  `evaluate_admission()` cannot be called on an unverified c
 | 1 | Complete `b7d769f` | Programmatic calibration, schema v2, ObservedOCISandbox, commit-pin |
 | 2 | Live-enforcement evidence **built** `7950aaa` | schema v3 provenance matrix; the 2.1–2.2b enforcement / recalibration scenarios (`gated` S3-completion pinned at `1d75d54`) |
 | B1 | **Merged** `c7f3c02` | Demonstration Board **apparatus**: manifest + gauntlet + render/admission gate (gap-1 capability-deletion, provider-gate SD1, real-podman FOLD-A SD2/SD7, Gate 3 render pin) |
+| 3.1 | **Built** | Render driver (`render_board`) — caller-law satisfied — + first two-sided real row (real-podman keystone: `ADMIT/fail` / `ADMIT`); signed capture records (local key, optional) |
 
-**Open / named follow-ons (stated plainly, not done):** a **populated** board — real agent
-artifact rows, the first is the next increment; a **render driver** that calls
-`assert_board_admissible` (the caller-law); **P2 cell-identity reconciliation**. §11 artifact
-binding: the board binds one immutable artifact digest per cell, but formal §11 closure is
-**not** claimed here.
+**Open / named follow-ons (stated plainly, not done):** more **populated** rows — Step 3.1
+lands the FIRST two-sided row (render driver + real-podman keystone); additional agent /
+detector rows follow; **P2 cell-identity reconciliation**. §11 artifact binding: the board
+binds one immutable artifact digest per cell, but formal §11 closure is **not** claimed here.
 
 ---
 
