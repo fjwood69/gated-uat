@@ -33,6 +33,15 @@ env:
   GATED_PIN: 1d75d54a97986e18fae499c370f8615e6cf89e15
 
 jobs:
+  sterility:
+    name: Content sterility
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check for internal/homelab markers in tracked content
+        run: python scripts/check-sterility.py
+
   lint:
     name: Lint (ruff)
     runs-on: ubuntu-latest
