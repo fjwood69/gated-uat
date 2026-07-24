@@ -20,8 +20,8 @@ import sys
 # (pattern, human-readable reason). Case-insensitive. Kept high-signal / low-false-positive:
 # specific homelab hostnames, paths, the known prod IP, LAN range, and internal id forms.
 MARKERS: list[tuple[str, str]] = [
-    (r"/home/dev", "absolute homelab path"),
-    (r"\bdev-host\b", "homelab hostname"),
+    (r"/home/nucadmin", "absolute homelab path"),
+    (r"\bnuc15pro\b", "homelab hostname"),
     (r"\buk-smr-", "homelab hostname"),
     (r"\bca-ws-raspi", "homelab hostname"),
     (r"\buk-ga-raspi", "homelab hostname"),
