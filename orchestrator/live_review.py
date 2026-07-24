@@ -26,13 +26,15 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from .gauntlet import ReviewClient, ReviewOutcome
+from .gauntlet import ReviewClient, ReviewOutcome, build_review_source_payload
 from .provider_gate import CompletionOnlyEgress, ReviewProviderClient, Transport
-from .render_driver import ReviewCapture
+from .render_driver import BoardArtifact, ReviewCapture
 
 # The Anthropic Messages API version header the transport pins (a header, never in the body).
 ANTHROPIC_VERSION = "2023-06-01"
@@ -263,13 +265,355 @@ def make_live_review_client(
 
 
 # ------------------------------------------------------------------
+# (Y) Board #3 — the REVIEWABLE wire: decoded file text, thin envelope-recompute
+# ------------------------------------------------------------------
+
+_REVIEW_SOURCE_DOMAIN = "gated-uat.review-source"
+# The strict top-level whitelist for a reviewable /v1/messages body (consult P2): a body may carry
+# EXACTLY these keys — so no system / tools / tool_choice / stop_sequences / temperature / a 2nd
+# message / an assistant prefill can smuggle model-visible content the source_digest recompute would
+# ignore. Enforced on OUR OWN emitted bytes, in BOTH the builder self-parse and the auditor.
+_REVIEWABLE_TOP_KEYS = frozenset({"model", "max_tokens", "stream", "messages"})
+
+
+class ReviewableWireError(ValueError):
+    """The reviewable wire (or the canonical source it is built from) is malformed — a shape, count,
+    whitelist, encoding, or reconstruction failure. Fail-closed: the builder raises before returning
+    a wire, and the auditor raises before admitting a reconstruction."""
+
+
+def _files_from_canonical_source(source_bytes: bytes) -> list[tuple[str, bytes]]:
+    """Invert ``canonical_review_source``: read its versioned, domain-separated envelope and return
+    the ordered ``(relpath, content_bytes)`` pairs. ``path_b64`` -> relpath is ``utf-8`` strict
+    (fail-closed on a non-utf-8 path — no parallel encoding); each per-file ``sha256`` is verified
+    against its ``content_b64`` (the envelope we were handed is internally consistent)."""
+    try:
+        doc = json.loads(source_bytes)
+    except Exception:  # noqa: BLE001
+        raise ReviewableWireError("canonical review source is not valid JSON") from None
+    if not isinstance(doc, dict) or doc.get("domain") != _REVIEW_SOURCE_DOMAIN:
+        raise ReviewableWireError("canonical review source has the wrong domain")
+    if doc.get("version") != 1:  # dissent P3 nit: a future serializer v2 must fail loudly
+        raise ReviewableWireError(f"unexpected review-source version {doc.get('version')!r}")
+    payload = doc.get("payload")
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+        raise ReviewableWireError("canonical review source payload is malformed")
+    out: list[tuple[str, bytes]] = []
+    for entry in payload["files"]:
+        if not isinstance(entry, dict):
+            raise ReviewableWireError("canonical review source file entry is not an object")
+        try:
+            relpath = base64.b64decode(entry["path_b64"], validate=True).decode(
+                "utf-8", errors="strict")
+            content = base64.b64decode(entry["content_b64"], validate=True)
+        except Exception:  # noqa: BLE001
+            raise ReviewableWireError("canonical review source file is not decodable") from None
+        if hashlib.sha256(content).hexdigest() != entry.get("sha256"):
+            raise ReviewableWireError("canonical review source per-file sha256 mismatch")
+        out.append((relpath, content))
+    return out
+
+
+def _strict_text_blocks(content: Any) -> list[str]:
+    """Whitelist the user-message ``content`` (consult P2): a list of >= 3 blocks, each EXACTLY
+    ``{"type":"text","text":<str>}`` with NO extra keys. Returns the ordered block texts."""
+    if not isinstance(content, list) or len(content) < 3:
+        raise ReviewableWireError("content must be [prompt, pathlist, >=1 file] text blocks")
+    texts: list[str] = []
+    for blk in content:
+        if (not isinstance(blk, dict) or set(blk) != {"type", "text"}
+                or blk.get("type") != "text" or not isinstance(blk.get("text"), str)):
+            raise ReviewableWireError("every content block must be exactly {type:text, text:str}")
+        texts.append(blk["text"])
+    return texts
+
+
+@dataclass(frozen=True)
+class ReviewableWire:
+    """A parsed, whitelist-checked reviewable wire: the prompt bytes shown to the model, the ordered
+    relpaths (block 1), the ordered ``(relpath, content_bytes)`` file blocks, and the recomputed
+    ``source_digest`` (via the SEALED serializer). Produced by ``parse_reviewable_wire`` — used by
+    the builder self-parse, the seal tests, and any external auditor."""
+
+    prompt_text: bytes
+    model: str
+    max_tokens: int
+    relpaths: tuple[str, ...]
+    files: tuple[tuple[str, bytes], ...]
+    source_digest: str
+
+
+def parse_reviewable_wire(request_bytes: bytes) -> ReviewableWire:
+    """Parse + STRICT-whitelist a Board #3 reviewable wire and recompute its ``source_digest`` by
+    REPLAYING the sealed ``build_review_source_payload`` (P3 Option A — no reimplementation).
+
+    Whitelist (consult P2, fail-closed): top-level keys are EXACTLY
+    ``{model, max_tokens, stream, messages}``; ``stream`` is ``False``; ``messages`` is EXACTLY one
+    ``{role, content}`` with ``role=='user'``; ``content`` is text blocks only, each EXACTLY
+    ``{type:text, text:str}``. No ``system`` / tools / stop_sequences / 2nd message / assistant
+    prefill / unknown key can carry model-visible content the recompute would miss. Then block 0 =
+    the prompt; block 1 = a JSON array of N relpaths; blocks 2..N+1 = the decoded file text,
+    count-aligned. The CALLER binds ``sha256(prompt_text)==review_prompt_hash`` and
+    ``source_digest==receipt.source_digest`` (see ``assert_reviewable_wire``)."""
+    try:
+        body = json.loads(request_bytes)
+    except Exception:  # noqa: BLE001
+        raise ReviewableWireError("wire is not valid JSON") from None
+    if not isinstance(body, dict) or set(body) != set(_REVIEWABLE_TOP_KEYS):
+        raise ReviewableWireError(
+            f"wire top-level keys must be exactly {sorted(_REVIEWABLE_TOP_KEYS)}")
+    if body.get("stream") is not False:
+        raise ReviewableWireError("wire stream must be false")
+    model = body["model"]
+    max_tokens = body["max_tokens"]
+    if (not isinstance(model, str) or isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int)):
+        raise ReviewableWireError("wire model/max_tokens mistyped")
+    messages = body["messages"]
+    if not isinstance(messages, list) or len(messages) != 1:
+        raise ReviewableWireError("wire must carry exactly one message")
+    msg = messages[0]
+    if not isinstance(msg, dict) or set(msg) != {"role", "content"} or msg.get("role") != "user":
+        raise ReviewableWireError("the one message must be exactly {role:'user', content:[...]}")
+    texts = _strict_text_blocks(msg["content"])
+    try:
+        relpaths = json.loads(texts[1])
+    except Exception:  # noqa: BLE001
+        raise ReviewableWireError("path-list block is not valid JSON") from None
+    if not isinstance(relpaths, list) or not all(isinstance(p, str) for p in relpaths):
+        raise ReviewableWireError("path-list must be a JSON array of strings")
+    if len(set(relpaths)) != len(relpaths):
+        raise ReviewableWireError("duplicate relpath in path-list")  # consult P6
+    file_texts = texts[2:]
+    if len(file_texts) != len(relpaths):
+        raise ReviewableWireError(
+            f"file-block count {len(file_texts)} != path count {len(relpaths)}")
+    files = tuple((relpaths[i], file_texts[i].encode("utf-8")) for i in range(len(relpaths)))
+    source_bytes = build_review_source_payload(list(files))
+    return ReviewableWire(
+        prompt_text=texts[0].encode("utf-8"), model=model, max_tokens=max_tokens,
+        relpaths=tuple(relpaths), files=files,
+        source_digest=hashlib.sha256(source_bytes).hexdigest())
+
+
+def assert_reviewable_wire(
+    request_bytes: bytes, *, review_prompt_hash: str, source_digest: str,
+    model: str, max_tokens: int,
+) -> ReviewableWire:
+    """Full external-auditor check: parse + whitelist, then bind the transmitted prompt to the
+    committed ``review_prompt_hash``, the recomputed source to the receipt's ``source_digest``, AND
+    the ``model`` / ``max_tokens`` to the pre-mint commitment fingerprint (consult P5 — a deviant
+    model/max_tokens must not pass merely because shape + source_digest do). Fail-closed on any
+    mismatch."""
+    wire = parse_reviewable_wire(request_bytes)
+    if hashlib.sha256(wire.prompt_text).hexdigest() != review_prompt_hash:
+        raise ReviewableWireError("wire prompt does not match committed review_prompt_hash")
+    if wire.source_digest != source_digest:
+        raise ReviewableWireError("wire source reconstruction != receipt source_digest")
+    if wire.model != model or wire.max_tokens != max_tokens:
+        raise ReviewableWireError("wire model/max_tokens != committed fingerprint")
+    return wire
+
+
+@dataclass(frozen=True)
+class AnthropicReviewableRequestBuilder:
+    """Board #3 (Y) ``ReviewRequestBuilder`` — the REVIEWABLE wire. Emits a minimal ``/v1/messages``
+    body whose one ``user`` message is EXACTLY: block 0 = the byte-exact published ``prompt_text``;
+    block 1 = a JSON array of the file relpaths in canonical order; blocks 2..N+1 = the DECODED
+    UTF-8 file text, one block per file. The model reads literal source; the auditor recomputes
+    ``source_digest`` by REPLAYING the sealed ``build_review_source_payload`` over the extracted
+    ``(relpath, content)`` — no base64 blob, no Merkle, no NFC. ``request_digest = sha256(wire)``
+    binds the WHOLE body; the strict top-level + block whitelist (consult P2) means no hidden
+    model-visible channel escapes the recompute.
+
+    Fail-closed: a non-utf-8 file (or relpath) raises (it cannot be shown as text); the builder then
+    SELF-PARSES the wire it built (consult P3) and asserts the recompute == the sealed
+    ``source_digest`` + the whitelist, before returning — a framing bug can never pass the builder
+    yet break the auditor.
+
+    NOT injection-safe (consult P1): a sealed file whose text instructs the reviewer can steer the
+    verdict. The receipt attests the request/response BINDING, not verdict correctness; the GATE
+    column (the independent detector) is the enforcement signal, and the rehearsal gate is a
+    LIVENESS/shape check, never a correctness check."""
+
+    prompt_text: bytes
+    model: str
+    max_tokens: int
+    max_source_bytes: int = _MAX_SOURCE_BYTES_DEFAULT
+
+    def __call__(
+        self, source_bytes: bytes, reviewer_lineage: str, review_prompt_hash: str
+    ) -> bytes:
+        if hashlib.sha256(self.prompt_text).hexdigest() != review_prompt_hash:
+            raise ReviewableWireError(
+                "prompt_text does not match review_prompt_hash (prereg binding)")
+        if len(source_bytes) > self.max_source_bytes:
+            raise ReviewableWireError(
+                f"sealed source {len(source_bytes)}B over cap {self.max_source_bytes}B")
+        files = _files_from_canonical_source(source_bytes)
+        prompt_str = self.prompt_text.decode("utf-8", errors="strict")
+        relpaths = [rel for rel, _ in files]
+        # strict utf-8 decode per file — fail-closed on non-utf-8 content (cannot be shown as text)
+        file_texts = [content.decode("utf-8", errors="strict") for _, content in files]
+        content_blocks: list[dict[str, str]] = [{"type": "text", "text": prompt_str}]
+        content_blocks.append({"type": "text", "text": json.dumps(
+            relpaths, separators=(",", ":"), ensure_ascii=True)})
+        content_blocks.extend({"type": "text", "text": t} for t in file_texts)
+        body: dict[str, Any] = {
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "stream": False,
+            "messages": [{"role": "user", "content": content_blocks}],
+        }
+        wire = json.dumps(
+            body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        # SELF-PARSE (consult P3): the wire we built must whitelist-parse AND recompute the SAME
+        # source_digest as the sealed serializer over these bytes — else fail closed before return.
+        parsed = parse_reviewable_wire(wire)
+        if parsed.source_digest != hashlib.sha256(source_bytes).hexdigest():
+            raise ReviewableWireError("builder self-parse: source_digest mismatch")
+        if parsed.prompt_text != self.prompt_text:
+            raise ReviewableWireError("builder self-parse: prompt mismatch")
+        if parsed.model != self.model or parsed.max_tokens != self.max_tokens:  # consult P5
+            raise ReviewableWireError("builder self-parse: model/max_tokens mismatch")
+        return wire
+
+    def fingerprint(self) -> dict[str, Any]:
+        """The builder identity bound into the pre-run commitment. NEVER includes prompt_text (only
+        its hash). The serializer id names the reviewable (Y) shape so a reader can distinguish it
+        from the (C) base64 builder."""
+        return {
+            "builder": "AnthropicReviewableRequestBuilder",
+            "model": self.model,
+            "max_tokens": self.max_tokens,
+            "review_prompt_hash": hashlib.sha256(self.prompt_text).hexdigest(),
+            "max_source_bytes": self.max_source_bytes,
+            "serializer": "json:sort_keys,sep=(,:),ensure_ascii,utf-8,reviewable-v1",
+        }
+
+
+# ------------------------------------------------------------------
+# Rehearsal gate (LIVENESS/shape ONLY — never correctness; consult P1)
+# ------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RehearsalRecord:
+    """The disclosed pre-mint rehearsal outcome (the three-strikes law): ONE unsealed transmission
+    of the committed wire SHAPE — same prompt, a throwaway prompt-irrelevant fixture — to the real
+    endpoint, proving the counterpart ENGAGES the shape (returns a parseable verdict) before the
+    seal is spent. LIVENESS/shape ONLY, never a correctness check (consult P1: the verdict is
+    unauthenticated + injection-vulnerable; the gate column is enforcement). ``disclosed`` is always
+    True (written into the run record); ``engaged`` is False on a refusal / transport failure — the
+    mint MUST NOT proceed on ``engaged=False``. NOT part of n."""
+
+    disclosed: bool
+    engaged: bool
+    provider_id: str
+    model_id: str
+    note: str
+
+
+def rehearse_reviewable_shape(
+    *, review_client: ReviewClient, builder: AnthropicReviewableRequestBuilder,
+    throwaway_source_bytes: bytes, reviewer_lineage: str = "rehearsal",
+) -> RehearsalRecord:
+    """Transmit the committed wire SHAPE once, over a throwaway prompt-irrelevant fixture, to prove
+    the counterpart engages it (consult P1: LIVENESS only). Uses the builder's own prompt hash so
+    the shape is identical to the sealed run. ``engaged`` = the client returned a parseable verdict;
+    a
+    refusal / transport failure is a caught, DISCLOSED non-engagement. Test-fake-must-match-real-
+    engine extension: in a test only the TRANSPORT may be faked, never the counterpart's content
+    acceptance."""
+    review_prompt_hash = hashlib.sha256(builder.prompt_text).hexdigest()
+    request_bytes = builder(throwaway_source_bytes, reviewer_lineage, review_prompt_hash)
+    try:
+        outcome = review_client(request_bytes, reviewer_lineage, review_prompt_hash)
+    except Exception as exc:  # noqa: BLE001 — a refusal / transport error is disclosed non-engagement
+        return RehearsalRecord(disclosed=True, engaged=False, provider_id="", model_id="",
+                               note=f"non-engagement: {type(exc).__name__}")
+    return RehearsalRecord(disclosed=True, engaged=True, provider_id=outcome.provider_id,
+                           model_id=outcome.model_id, note=f"verdict={outcome.verdict}")
+
+
+# ------------------------------------------------------------------
+# The HARD pre-mint gate (dissent P2-1: a declared control nothing consumes is not a control)
+# ------------------------------------------------------------------
+
+
+class RehearsalGateError(RuntimeError):
+    """The pre-mint rehearsal gate refused: no disclosed+engaged rehearsal, or the rehearsal fixture
+    was not disjoint from the demonstration pair. A live reviewable mint MUST NOT proceed."""
+
+
+def assert_rehearsal_admits(rehearsal: RehearsalRecord | None) -> None:
+    """The HARD pre-mint gate (dissent P2-1): a live reviewable mint may proceed ONLY behind a
+    DISCLOSED rehearsal that ENGAGED. Absent or non-engaged -> raise — never a skippable library
+    call. RUN-RECORD LAW (D2): the rehearsal is transmitted BEFORE the commitment is published; its
+    fixture is DISJOINT from the demonstration pair; iterating the shape against the throwaway is
+    legitimate, iterating against the demonstration pair is FORBIDDEN."""
+    if rehearsal is None:
+        raise RehearsalGateError("mint requires a disclosed rehearsal; none provided")
+    if not rehearsal.disclosed:
+        raise RehearsalGateError("rehearsal must be disclosed in the run record")
+    if not rehearsal.engaged:
+        raise RehearsalGateError(
+            f"rehearsal non-engagement ({rehearsal.note}) — mint MUST NOT proceed")
+
+
+def mint_reviewable_board(
+    *, rehearsal: RehearsalRecord, throwaway_source_digest: str,
+    demonstration_source_digests: frozenset[str], out_dir: Path,
+    render: Callable[[], BoardArtifact],
+) -> BoardArtifact:
+    """THE reviewable-mint entrypoint (dissent P2-1) — the ONLY sanctioned path to a live reviewable
+    board, so skipping the rehearsal is UNREPRESENTABLE (there is no mint without this call, and no
+    call without an engaged record). ``rehearsal`` is a REQUIRED argument. Gates on
+    ``assert_rehearsal_admits``, enforces the D2 disjointness (the rehearsal fixture's
+    ``source_digest`` must NOT be one of the demonstration pair's — so the shape was never tuned
+    against the graded artifacts), runs ``render`` (the pre-bound live ``render_board``), and writes
+    the disclosed rehearsal record into ``out_dir`` alongside the commitment."""
+    assert_rehearsal_admits(rehearsal)
+    if throwaway_source_digest in demonstration_source_digests:
+        raise RehearsalGateError(
+            "rehearsal fixture must be DISJOINT from the demonstration pair (D2)")
+    artifact = render()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "rehearsal.json").write_text(json.dumps({
+        "kind": "rehearsal_record",
+        "disclosed": rehearsal.disclosed,
+        "engaged": rehearsal.engaged,
+        "provider_id": rehearsal.provider_id,
+        "model_id": rehearsal.model_id,
+        "note": rehearsal.note,
+        "throwaway_source_digest": throwaway_source_digest,
+    }, indent=2, sort_keys=True), encoding="utf-8")
+    return artifact
+
+
+# ------------------------------------------------------------------
 # The light pre-run board commitment (gaming guard)
 # ------------------------------------------------------------------
 
 
+class _FingerprintingBuilder(Protocol):
+    """A review-request builder that also fingerprints itself for the commitment — structurally
+    satisfied by BOTH the (C) ``AnthropicMessagesRequestBuilder`` and the (Y)
+    ``AnthropicReviewableRequestBuilder`` (so build_commitment accepts either)."""
+
+    model: str
+    max_tokens: int
+
+    def fingerprint(self) -> dict[str, Any]: ...
+
+    def __call__(
+        self, source_bytes: bytes, reviewer_lineage: str, review_prompt_hash: str
+    ) -> bytes: ...
+
+
 def build_commitment(
     *, board_id: str, gated_commit: str, code_sha: str, corpus_version: str, provider_id: str,
-    base_url: str, builder: AnthropicMessagesRequestBuilder, declared_n: int, preregistered_at: str,
+    base_url: str, builder: _FingerprintingBuilder, declared_n: int, preregistered_at: str,
     signing_key: Any,
 ) -> dict[str, Any]:
     """The LIGHT pre-run board commitment — PUBLISHED before the first live call. It pins the
@@ -300,7 +644,10 @@ def build_commitment(
 
 
 __all__ = [
-    "ANTHROPIC_VERSION", "AnthropicMessagesRequestBuilder", "CapturingReviewClient",
-    "RedactedTransportError", "build_commitment", "make_anthropic_transport",
-    "make_live_review_client", "parse_anthropic_verdict", "validate_base_url",
+    "ANTHROPIC_VERSION", "AnthropicMessagesRequestBuilder", "AnthropicReviewableRequestBuilder",
+    "CapturingReviewClient", "RedactedTransportError", "RehearsalGateError", "RehearsalRecord",
+    "ReviewableWire", "ReviewableWireError", "assert_rehearsal_admits", "assert_reviewable_wire",
+    "build_commitment", "make_anthropic_transport", "make_live_review_client",
+    "mint_reviewable_board", "parse_anthropic_verdict", "parse_reviewable_wire",
+    "rehearse_reviewable_shape", "validate_base_url",
 ]

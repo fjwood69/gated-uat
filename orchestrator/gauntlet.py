@@ -391,6 +391,32 @@ def _strip_seal_prefix(name: str) -> str | None:
     return parts[1] if len(parts) == 2 and parts[1] else None
 
 
+def build_review_source_payload(files: list[tuple[str, bytes]]) -> bytes:
+    """The SINGLE sealed serializer for review-source bytes (Board #3 P3, Option A). Sort ``files``
+    by RAW utf-8 relpath (mirroring ``core.tree_hash``), build the per-file ``{path_b64, sha256,
+    content_b64}`` payload, and domain-separate via ``canonical_bytes``. ``canonical_review_source``
+    (a sealed tar) and the Board #3 reviewable-wire auditor (wire-extracted ``(relpath, content)``)
+    BOTH call this, so a ``source_digest`` recompute cannot DRIFT from the sealed form —
+    the recompute is a REPLAY of one function, not a parallel reimplementation.
+
+    Behaviour-preserving: byte-identical to the prior inline construction, so every existing
+    ``source_digest`` is unchanged (3.1 / board #1 untouched). ``rel.encode('utf-8')`` fails closed
+    on a non-utf-8 relpath (the existing path binding — no parallel path encoding is introduced)."""
+    from core.chain import canonical_bytes
+    ordered = sorted(files, key=lambda e: e[0].encode("utf-8"))
+    payload = {
+        "files": [
+            {
+                "path_b64": base64.b64encode(rel.encode("utf-8")).decode("ascii"),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "content_b64": base64.b64encode(data).decode("ascii"),
+            }
+            for rel, data in ordered
+        ]
+    }
+    return canonical_bytes("gated-uat.review-source", payload)
+
+
 def canonical_review_source(sealed: SealedArtifact) -> bytes:
     """Serialise the sealed artifact's FILE BYTES into a canonical, versioned, domain-separated
     document — the exact bytes the LLM reviewer is shown (FOLD-B). Reads the tar MEMBERS (not the
@@ -405,7 +431,6 @@ def canonical_review_source(sealed: SealedArtifact) -> bytes:
     (the seal rejects them), so every entry is a regular file."""
     import tarfile
 
-    from core.chain import canonical_bytes
     files: list[tuple[str, bytes]] = []
     seen: set[str] = set()
     with tarfile.open(sealed.archive, "r") as tf:
@@ -437,17 +462,10 @@ def canonical_review_source(sealed: SealedArtifact) -> bytes:
         raise DigestMismatchError(
             f"review source does not reconstruct the sealed digest: {reconstructed!r} != "
             f"{sealed.digest!r}")
-    payload = {
-        "files": [
-            {
-                "path_b64": base64.b64encode(rel.encode("utf-8")).decode("ascii"),
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "content_b64": base64.b64encode(data).decode("ascii"),
-            }
-            for rel, data in files
-        ]
-    }
-    return canonical_bytes("gated-uat.review-source", payload)
+    # Delegate the payload construction to the SINGLE sealed serializer (Board #3 P3, Option A) —
+    # byte-identical to the prior inline build, and the exact function the reviewable-wire auditor
+    # replays. ``files`` is already sorted above; the helper re-sorts idempotently.
+    return build_review_source_payload(files)
 
 
 # A sandbox factory: constructs a FRESH sandbox for one stage run (default: a real OCISandbox).
