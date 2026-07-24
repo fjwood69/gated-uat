@@ -207,8 +207,10 @@ def test_transport_redacts_key_from_exceptions() -> None:
 
 
 def test_real_transport_wraps_failures_redacted() -> None:
-    # make_anthropic_transport with a bad host: httpx raises -> RedactedTransportError
-    # whose text carries no url/headers/body. (No network reached; DNS/connect fails fast.)
+    # make_anthropic_transport with a bad host: httpx raises -> RedactedTransportError with no
+    # url/headers/body. httpx is a LIVE-RUN-ONLY dep (lazy) -> skip where absent; the redaction
+    # CONTRACT is covered httpx-free by test_transport_redacts_key_from_exceptions.
+    pytest.importorskip("httpx")
     secret = "sk-ant-LEAK-CHECK"
     transport = make_anthropic_transport(secret, timeout_s=0.001)
     with pytest.raises(RedactedTransportError) as ei:
