@@ -19,9 +19,9 @@ from typing import Any
 
 from nacl.signing import SigningKey
 
-# Dedicated pin worktree — never reuse ../gated (the live step-3.5-jobs
-# checkout).  One-time setup: run
-#   git -C ../gated worktree add --detach ../gated-uat-pin \
+# Dedicated pin worktree — never reuse the live 'gated' checkout (use a detached pin).
+# One-time setup (with $GATED = your local gated clone): run
+#   git -C "$GATED" worktree add --detach ../gated-uat-pin \
 #       1d75d54a97986e18fae499c370f8615e6cf89e15
 # then leave it in place.
 _GATED_DEV = Path(__file__).parent.parent / "gated-uat-pin"

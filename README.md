@@ -149,13 +149,13 @@ pip install -e ".[dev]"   # pynacl + mypy + ruff + pytest
 `gated` is not on PyPI.  The harness resolves it from a dedicated worktree:
 
 ```
-../gated-uat-pin    ← pinned at 1d75d54a97986e18fae499c370f8615e6cf89e15
+../gated-uat-pin    ← a sibling of this repo, pinned at 1d75d54a97986e18fae499c370f8615e6cf89e15
 ```
 
-One-time setup (after cloning this repo):
+One-time setup (after cloning this repo), with `$GATED` = your local `gated` clone:
 
 ```bash
-git -C ../gated worktree add --detach \
+git -C "$GATED" worktree add --detach \
     ../gated-uat-pin \
     1d75d54a97986e18fae499c370f8615e6cf89e15
 ```

@@ -8,3 +8,9 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+
+# Ops/local context — not product docs (host fingerprint, secret retrieval)
+CLAUDE.md
+AGENTS.md
+.claude/
+.mcp.json

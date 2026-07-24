@@ -25,7 +25,7 @@ def _derive_gated_commit() -> str | None:
     """
     from orchestrator.gated_pin import verify_gated_dependency
 
-    # Dedicated pin worktree — never ../gated (live step-3.5-jobs checkout).
+    # Dedicated pin worktree — never the live 'gated' checkout (a detached pin only).
     gated_dir = Path(__file__).parent.parent / "gated-uat-pin"
     if not gated_dir.is_dir():
         return None
