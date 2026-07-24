@@ -134,13 +134,15 @@ def build_manifest_payload(
 # ------------------------------------------------------------------
 
 
-def build_manifest(payload: dict[str, Any], signing_key: SigningKey) -> Receipt:
-    """Sign the board manifest. The receipt's ``run_id`` is a fresh UUID4 board id; its ``digest``
-    (``receipt.digest``) is the anchor every downstream cell receipt binds to. build_receipt
-    validates the payload (schema) + signs — so a malformed / incomplete-denominator manifest is
-    rejected at mint time, before any agent runs."""
-    board_id = str(uuid.uuid4())
-    return build_receipt(MANIFEST_KIND, board_id, payload, signing_key)
+def build_manifest(
+    payload: dict[str, Any], signing_key: SigningKey, *, board_id: str | None = None,
+) -> Receipt:
+    """Sign the board manifest. The receipt's ``run_id`` is the board id — a fresh UUID4 by default,
+    or the caller-pre-minted ``board_id`` (so a LIVE board can PUBLISH its board_id in the pre-run
+    commitment before any live call; a cherry-picked re-run then carries a different board_id). Its
+    ``digest`` is the anchor every cell receipt binds to. build_receipt validates the payload
+    (schema) + signs — so a malformed / incomplete-denominator manifest is rejected at mint time."""
+    return build_receipt(MANIFEST_KIND, board_id or str(uuid.uuid4()), payload, signing_key)
 
 
 def verify_manifest(receipt: Receipt, verify_key: VerifyKey) -> dict[str, Any]:
