@@ -32,3 +32,12 @@ separate board**, not an n=1 re-roll — so it is NOT done here.
 - Replay→normalize whole-board identity is not asserted here (live ERROR cells differ in error text
   from a recorded replay's no-capture error); the per-capture `request_b64` binding covers the
   successful cells' replayability.
+
+## Capture accounting (2 records, 1 file — content-addressing, not a discrepancy)
+The `reviewer_lineage` is NOT carried on the (Y) wire, so both tempting cells
+(`retry-swallow/claude-x`, `retry-swallow/gpt-y`) transmitted **byte-identical** request bodies →
+one `request_digest` → **one** file in `captures/`, referenced by **two** per-cell capture records
+in `board.json`. The store dedups by digest while the board keeps per-cell accounting; the shared
+digest is itself truthful — *the reviewer was shown the same code twice and returned the same
+verdict.* If a future wire ever put lineage-differentiating context into the request, the digests
+would fork automatically. The clean ERROR cells have no captures (truncate → ERROR, no verdict).
