@@ -1,0 +1,23 @@
+{
+  "body": {
+    "base_url": "https://api.anthropic.com",
+    "board_id": "19e2136b-7fe1-41c6-b4a1-f3da008e3b81",
+    "builder": {
+      "builder": "AnthropicReviewableRequestBuilder",
+      "max_source_bytes": 524288,
+      "max_tokens": 512,
+      "model": "claude-opus-5",
+      "review_prompt_hash": "fe6ceec653c971522b04fc0fc2f8c36b192cc888a7d66eda12e87612fe713b19",
+      "serializer": "json:sort_keys,sep=(,:),ensure_ascii,utf-8,reviewable-v1"
+    },
+    "code_sha": "7d6e35a4ab55db0183b571107616dc6b5d53678d1999633c7e1f36dbeafac389",
+    "corpus_version": "v1",
+    "declared_n": 1,
+    "gated_commit": "1d75d54",
+    "kind": "board_commitment",
+    "preregistered_at": "2026-07-24T17:40:46Z",
+    "provider_id": "anthropic"
+  },
+  "signature": "7089d29b5d7ac9800761f6e59dfadb8092ee70faa8f459ddf9dff7596ff74ed931545992614bc5f210df9b00026fbac20ae180ca7e381c15ea978fd5698d460b",
+  "verify_key_hex": "9046f263ff661623a8d064e7fe56d8e7ca143a2988d34c64b27d06d1ed4c0ed7"
+}
