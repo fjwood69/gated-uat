@@ -1,0 +1,23 @@
+{
+  "body": {
+    "base_url": "https://api.anthropic.com",
+    "board_id": "67e2c03c-ae24-4db1-ac6a-30481ca5dbd5",
+    "builder": {
+      "builder": "AnthropicMessagesRequestBuilder",
+      "max_source_bytes": 524288,
+      "max_tokens": 512,
+      "model": "claude-sonnet-5",
+      "review_prompt_hash": "ed23540326c0f51de71d93f03ee0a5cb24ee7507ceba996d2dc67a88ff4fb1c6",
+      "serializer": "json:sort_keys,sep=(,:),ensure_ascii,utf-8,no-trailing-newline"
+    },
+    "code_sha": "83be50a65c6809b564b534792d530ec869a77a55aaf4935b58aa110ce5d7820c",
+    "corpus_version": "v1",
+    "declared_n": 1,
+    "gated_commit": "1d75d54",
+    "kind": "board_commitment",
+    "preregistered_at": "2026-07-24T13:17:13Z",
+    "provider_id": "anthropic"
+  },
+  "signature": "b8925cfd31815ab77dbd930fff7d52561e36bc080b9b965e1b55d11729235e8314d5e4e852758054f1674cc07de665363927bb9afe009faf0d828580ac8c420f",
+  "verify_key_hex": "46e9adea0143e5df0eca42fe7f21fb4fe724749954639b7f8a01f5c7b2ba5fe8"
+}

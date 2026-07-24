@@ -1,0 +1,26 @@
+{
+  "digest": "c11c22ceac28b2013e570c93946d7a89748c9e02d9f6b02c1b3ca29e70293e5f",
+  "kind": "cell_stage",
+  "payload": {
+    "artifact_tree_digest": "sha256:645a48d542aad9d5f9980a7887fbe9fa04fe56408f591c9c8bb120e132227d7a",
+    "cell_id": "retry-clean/claude-x/0",
+    "code_sha": "4f2963557cf4129b28f68d61e9eb44212b2f6c211b058d86b9952ef50ac6bf96",
+    "executed_at": "2026-07-24T13:26:22.713678Z",
+    "lineage": "claude-x",
+    "manifest_digest": "d4d32940185014344a813d8791d500aab936957ba561ded7eccf03bb66b54896",
+    "observation": {
+      "gate_outcome": "run_verdict",
+      "measured_tree_digest": "sha256:645a48d542aad9d5f9980a7887fbe9fa04fe56408f591c9c8bb120e132227d7a",
+      "result_kind": "admitted_run",
+      "result_reason": "unanimous pass across trials",
+      "result_sub_reason": ""
+    },
+    "outcome": "pass",
+    "reviewer_lineage": "gpt-y",
+    "schema_version": 1,
+    "side": "clean",
+    "stage": "gate"
+  },
+  "run_id": "5c88b8cf-f430-4e00-b5ff-ea5eb6e72acb",
+  "signature": "ae3d03a4989a3293a2c081f3785d930a4d11247068601a3ccc31208af9508a84a556780d165cb27019938afb2f5556bd7e0967b6f13b8c7b3033f9f3367de801"
+}

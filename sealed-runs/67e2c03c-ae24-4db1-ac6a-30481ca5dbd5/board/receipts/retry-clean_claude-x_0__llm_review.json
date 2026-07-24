@@ -1,0 +1,22 @@
+{
+  "digest": "254785139b9eeb0e8c7c2571fcb4431a64522ec76626d4b5f8ae450a9c354d8d",
+  "kind": "cell_stage",
+  "payload": {
+    "artifact_tree_digest": "sha256:645a48d542aad9d5f9980a7887fbe9fa04fe56408f591c9c8bb120e132227d7a",
+    "cell_id": "retry-clean/claude-x/0",
+    "code_sha": "4f2963557cf4129b28f68d61e9eb44212b2f6c211b058d86b9952ef50ac6bf96",
+    "executed_at": "2026-07-24T13:26:01.013270Z",
+    "lineage": "claude-x",
+    "manifest_digest": "d4d32940185014344a813d8791d500aab936957ba561ded7eccf03bb66b54896",
+    "observation": {
+      "harness_error": "ValueError: review response has no content blocks"
+    },
+    "outcome": "error",
+    "reviewer_lineage": "gpt-y",
+    "schema_version": 1,
+    "side": "clean",
+    "stage": "llm_review"
+  },
+  "run_id": "5c88b8cf-f430-4e00-b5ff-ea5eb6e72acb",
+  "signature": "7b348369b5391e0434d4c12ce352a360e2f76888e8176f207b819b701332a59207d5f5e187d2aac0647d5e290cd482fe3007aca35f1ac0485d3f6be2d5aad206"
+}
