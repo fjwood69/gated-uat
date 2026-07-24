@@ -653,6 +653,12 @@ class ReviewOutcome:
 # that transmits request_bytes verbatim (see the provider-gate ReviewClient).
 ReviewClient = Callable[[bytes, str, str], ReviewOutcome]
 
+# A review-request builder: (source_bytes, reviewer_lineage, review_prompt_hash) -> request_bytes.
+# DEFAULT = _canonical_review_request (the gated-uat envelope) so board #1 + ALL 3.1 request_digests
+# stay byte-identical. Board #2 injects a builder that emits a REAL provider API body
+# (live_review.AnthropicMessagesRequestBuilder) — the additive (C) exception to injection-only.
+ReviewRequestBuilder = Callable[[bytes, str, str], bytes]
+
 
 def _canonical_review_request(
     source_bytes: bytes, reviewer_lineage: str, review_prompt_hash: str
@@ -675,16 +681,19 @@ def llm_review_stage(
     reviewer_lineage: str,
     review_prompt_hash: str,
     review_client: ReviewClient,
+    build_request: ReviewRequestBuilder = _canonical_review_request,
 ) -> StageObservation:
     """Serialise the sealed artifact to canonical source bytes (self-checked to reconstruct the
-    sealed digest), BUILD the canonical request envelope embedding that source, hand the exact
-    request bytes to the (bytes-in/response-out) review client, and record it. ``outcome`` =
-    pass iff the verdict is exactly ``approve``. Binds ``source_digest`` (the sealed source) and
-    ``request_digest`` (the harness-built request EMBEDS the source — containment is structural)
-    + ``response_digest``. Measurement, not security."""
+    sealed digest), BUILD the review request (``build_request``; default = the canonical envelope,
+    board #2 = a real provider body), hand the exact request bytes to the (bytes-in/response-out)
+    review client, and record it. ``outcome`` = pass iff the verdict is exactly ``approve``. Binds
+    ``source_digest`` (the sealed source) and ``request_digest`` (whatever the builder produced,
+    which EMBEDS the source — containment is structural) + ``response_digest``. Measurement, not
+    security. ``build_request`` is additive: with the default, request bytes/digest are unchanged
+    from before (3.1 preserved)."""
     source_bytes = canonical_review_source(sealed)
     source_digest = hashlib.sha256(source_bytes).hexdigest()
-    request_bytes = _canonical_review_request(source_bytes, reviewer_lineage, review_prompt_hash)
+    request_bytes = build_request(source_bytes, reviewer_lineage, review_prompt_hash)
     request_digest = hashlib.sha256(request_bytes).hexdigest()
     result = review_client(request_bytes, reviewer_lineage, review_prompt_hash)
     response_digest = hashlib.sha256(result.raw_response).hexdigest()
