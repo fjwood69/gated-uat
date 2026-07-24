@@ -1,0 +1,9 @@
+{
+  "disclosed": true,
+  "engaged": true,
+  "kind": "rehearsal_record",
+  "model_id": "claude-opus-5",
+  "note": "verdict=approve",
+  "provider_id": "anthropic",
+  "throwaway_source_digest": "6de8346d4fc43b9ec084c62df37c38224b97bcf8680bd2d6d8ea21d19e8af57e"
+}
