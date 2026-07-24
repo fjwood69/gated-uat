@@ -1,0 +1,26 @@
+{
+  "digest": "59dba9f8ec6c2a98e5fc0ec11f254c2baa226767710c2e4bf999943beb458341",
+  "kind": "cell_stage",
+  "payload": {
+    "artifact_tree_digest": "sha256:645a48d542aad9d5f9980a7887fbe9fa04fe56408f591c9c8bb120e132227d7a",
+    "cell_id": "retry-clean/gpt-y/0",
+    "code_sha": "0c970c96aa0e6c3d946397dec21ea3a4ab75b55857ca18d9bfd9410bf2718066",
+    "executed_at": "2026-07-24T17:47:25.609051Z",
+    "lineage": "gpt-y",
+    "manifest_digest": "1724d056118fac488d41cf917ac7d8d23fac70900b215608e747109699ae0797",
+    "observation": {
+      "container_exit_code": 0,
+      "image_digest": "sha256:a29eddb3f7bde0db6e79775d580b6cdf03ef27156ce07232aa7b4049d618ab24",
+      "invocation_digest": "dc2b0674be2082dd161809a250d950fba0491f4eb07c328a5d2f814766c04583",
+      "pytest_status": "passed",
+      "sandbox_isolation_level": "hermetic"
+    },
+    "outcome": "pass",
+    "reviewer_lineage": "claude-x",
+    "schema_version": 1,
+    "side": "clean",
+    "stage": "own_tests"
+  },
+  "run_id": "c75dc2b2-989b-42c1-982a-95dcdac432fa",
+  "signature": "d0489970ab80a3d4661301df431ff33ce356fbca55d93178f9ee84b9ec618e58bf26dac7b3c7dc520b3e8f3fbd9f4670e954122ddfdad6ba742eb178adee570c"
+}

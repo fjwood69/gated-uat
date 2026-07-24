@@ -1,0 +1,22 @@
+{
+  "digest": "91ba7e6b59445fb9e9bb09dfacac4134ef7c48183fb67dd7e6caf7f5e0550702",
+  "kind": "cell_stage",
+  "payload": {
+    "artifact_tree_digest": "sha256:645a48d542aad9d5f9980a7887fbe9fa04fe56408f591c9c8bb120e132227d7a",
+    "cell_id": "retry-clean/gpt-y/0",
+    "code_sha": "0c970c96aa0e6c3d946397dec21ea3a4ab75b55857ca18d9bfd9410bf2718066",
+    "executed_at": "2026-07-24T17:47:34.250118Z",
+    "lineage": "gpt-y",
+    "manifest_digest": "1724d056118fac488d41cf917ac7d8d23fac70900b215608e747109699ae0797",
+    "observation": {
+      "harness_error": "ValueError: review response truncated (stop_reason=max_tokens) \u2014 raise max_tokens"
+    },
+    "outcome": "error",
+    "reviewer_lineage": "claude-x",
+    "schema_version": 1,
+    "side": "clean",
+    "stage": "llm_review"
+  },
+  "run_id": "c75dc2b2-989b-42c1-982a-95dcdac432fa",
+  "signature": "1c634dc5eb6ef209b898045ff434efe6ddd9734d6e251a3d8344dfdc00b3a40b866fd93d6d3ca4d9731564d8c1110879dbafdc1a975d013cfb74792c12e6cd0e"
+}

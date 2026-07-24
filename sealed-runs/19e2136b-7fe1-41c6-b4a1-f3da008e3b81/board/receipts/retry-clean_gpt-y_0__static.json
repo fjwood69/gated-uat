@@ -1,0 +1,25 @@
+{
+  "digest": "c9782b2df8b73012d623675f3d2ed0eae9a7b871cdd35858c01b244a85079c8a",
+  "kind": "cell_stage",
+  "payload": {
+    "artifact_tree_digest": "sha256:645a48d542aad9d5f9980a7887fbe9fa04fe56408f591c9c8bb120e132227d7a",
+    "cell_id": "retry-clean/gpt-y/0",
+    "code_sha": "0c970c96aa0e6c3d946397dec21ea3a4ab75b55857ca18d9bfd9410bf2718066",
+    "executed_at": "2026-07-24T17:47:24.964796Z",
+    "lineage": "gpt-y",
+    "manifest_digest": "1724d056118fac488d41cf917ac7d8d23fac70900b215608e747109699ae0797",
+    "observation": {
+      "env_digest": "sha256:a29eddb3f7bde0db6e79775d580b6cdf03ef27156ce07232aa7b4049d618ab24",
+      "invocation_digest": "04cd83f3c3168eebaade2ba0b9d442ecdb30f10699ff2d19a130acc5e529a093",
+      "mypy_exit": 0,
+      "ruff_exit": 0
+    },
+    "outcome": "pass",
+    "reviewer_lineage": "claude-x",
+    "schema_version": 1,
+    "side": "clean",
+    "stage": "static"
+  },
+  "run_id": "c75dc2b2-989b-42c1-982a-95dcdac432fa",
+  "signature": "2a7810b0eb232f0c4a905ad935296afe363a3e8884132f9679383b150f28f8726ba09460fec4ec3978816507ea5b4b763d25e36dd31ddea295203c8d161cbf02"
+}

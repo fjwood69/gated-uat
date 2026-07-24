@@ -1,0 +1,17 @@
+RUN DISCLOSURE — Board #3 sealed live mint (board 19e2136b)
+
+FALLBACKS: Automatic provider fallbacks are OPT-IN in this harness and were NOT enabled for
+this run — i.e. default-off, explicitly not turned on. The live review egress posts DIRECT to
+https://api.anthropic.com (trust_env=False, proxy=None, follow_redirects=False): no Bifrost, no
+provider fallback, no proxy.
+
+RESPONSE-MODEL-ECHO: the echo assert was run over EVERY live capture PRE-PUBLICATION — each
+capture's response body model was asserted, by exact equality, == "claude-opus-5" (no prefix or
+dated-variant tolerance). A mismatch would have ABORTED publication of the board (the seal does
+not spend; a finding publishes instead — the same honest-abort shape as a failed rehearsal). All
+live captures passed. This guards a silent server-side model substitution the signed fingerprint
+cannot see.
+
+Declared control + the measurement that checked it, side by side: reviewer of record is
+claude-opus-5 (launch day); the pre-mint rehearsal was LIVENESS/shape only, never a correctness
+check.
