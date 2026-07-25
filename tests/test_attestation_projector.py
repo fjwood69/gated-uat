@@ -121,9 +121,33 @@ def test_board_status_reflects_the_review_column() -> None:
     """Board ruling 5: emitting over a partially-errored board is honest ONLY if every Statement
     carries the board-level state. #2 refused entirely; #3 truncated on the clean cells."""
     for st in _statements(BOARD2):
-        assert st["predicate"]["attested"]["board_status"] == "review_column_refused"
+        assert st["predicate"]["derived"]["board_status"]["value"] == "review_column_refused"
     for st in _statements(BOARD3):
-        assert st["predicate"]["attested"]["board_status"] == "partial_error"
+        assert st["predicate"]["derived"]["board_status"]["value"] == "partial_error"
+
+
+@pytest.mark.parametrize("run_dir", [BOARD3, BOARD2], ids=["board3", "board2"])
+def test_board_status_is_derived_only_never_attested(run_dir: Path) -> None:
+    """Dissent P1: board_status is a PROJECTOR COMPUTATION over the board's llm_review outcomes,
+    so it must not occupy a measured-shaped slot — the same law merge_effect was moved for.
+
+    Note WHY this needs its own seal: the stranger-simulation CANNOT catch this class. The review
+    receipts are public, so a stranger recomputes the identical string and the keystone passes on a
+    misclassified field. Reproducibility and correct CLASSIFICATION are two different properties.
+    """
+    for st in _statements(run_dir):
+        assert "board_status" not in st["predicate"]["attested"]
+        assert "board_status" in st["predicate"]["derived"]
+
+
+@pytest.mark.parametrize("run_dir", [BOARD3, BOARD2], ids=["board3", "board2"])
+def test_no_projector_computation_hides_in_attested(run_dir: Path) -> None:
+    """The class law, not just its instances: no key that exists in derived.* may ALSO appear in
+    attested.*. (The structural closure — populating attested.* only through a reader that records
+    each field's source artifact + JSON pointer — is a named follow-up increment.)"""
+    for st in _statements(run_dir):
+        overlap = set(st["predicate"]["derived"]) & set(st["predicate"]["attested"])
+        assert not overlap, f"projector computation(s) dual-homed in attested: {sorted(overlap)}"
 
 
 def test_scope_disclaims_board_level_and_review_column() -> None:
@@ -132,6 +156,7 @@ def test_scope_disclaims_board_level_and_review_column() -> None:
     joined = " ".join(scope["does_not_attest"]).lower()
     assert "unauthenticated" in joined and "review" in joined
     assert "board-level" in joined
+    assert "derived.board_status" in joined, "scope must point at the DERIVED board_status"
     assert scope["trust_root"] == "local-key"          # machine-readable enum, Rego-routable
 
 

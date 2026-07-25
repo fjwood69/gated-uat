@@ -72,7 +72,8 @@ SCOPE = {
         "provenance of the bytes (a provenance predicate's job — they compose on the same subject)",
         "general correctness of the artifact",
         "anything about the review column: llm_review verdicts are UNAUTHENTICATED model output",
-        "any board-level claim — this Statement is scoped to ONE cell (see attested.board_status)",
+        "any board-level claim — this Statement is scoped to ONE cell (see derived.board_status, "
+        "which is a projector computation, not a gate measurement)",
     ],
     "trust_root": "local-key",
 }
@@ -194,7 +195,7 @@ def build_statements(
                 "measured_tree_digest": str(obs.get("measured_tree_digest", "")),
             },
             "cell": {
-                "cell_id": cell_id, "task_id": str(p["side"]) and task_id,
+                "cell_id": cell_id, "task_id": task_id,
                 "side": str(p["side"]), "lineage": str(p["lineage"]),
                 "reviewer_lineage": str(p["reviewer_lineage"]),
             },
@@ -204,7 +205,12 @@ def build_statements(
             "gated_commit": str(mp["gated_commit"]),
             "preregistered_at": str(mp["preregistered_at"]),
             "denominator": mp["denominator"],
-            "board_status": board_status["value"],
+            # NOTE: board_status is NOT here. It is a PROJECTOR COMPUTATION over the board's
+            # llm_review outcomes, so it lives ONLY in derived.* with its recipe (dissent P1). A
+            # computed value in a measured-shaped slot is the built-not-bound pattern — the same
+            # one merge_effect was moved for. Reproducibility (the stranger test) does NOT imply
+            # correct classification: a stranger recomputes this string identically, so the
+            # keystone passes on a misclassified field. Class is enforced here and by a seal.
             "linkage": {
                 "board_id": board_id,
                 "manifest_digest": str(p["manifest_digest"]),

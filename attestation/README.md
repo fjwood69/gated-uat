@@ -9,6 +9,12 @@ touches nothing sealed — no `render_board`, no receipt schema, no provider-gat
 python attestation/projector.py sealed-runs/<board_id> --out sealed-runs/<board_id>/attestations
 ```
 
+> **`sealed-runs/<board_id>/attestations/` is POST-HOC PROJECTOR OUTPUT — it is NOT part of the
+> mint seal.** Anything sitting in a sealed-run directory reads as "sealed" by default, so state it
+> plainly: these files were produced *after* publication by re-reading the record, signed by a
+> projector key, and nothing in them was signed at mint time. The mint-sealed evidence is
+> `commitment.json`, `board/receipts/`, and `board/captures/`.
+
 ## What this attests (and the one that matters)
 
 One artifact digest can carry several attestations answering different questions:
@@ -42,6 +48,28 @@ The split is **measured, not asserted** — `tests/test_attestation_projector.py
 **stranger simulation**: it copies *only* the published run directory into an isolated location
 (no repo tree, no PolicyStore, no local state), re-projects, and byte-compares `attested` +
 `derived`. `declared` is excluded by construction.
+
+**What that test does and does not prove (named honestly):**
+
+- ✅ **Data-plane isolation** — the projector needs *nothing* beyond the published run directory:
+  no PolicyStore, no repo working tree, no local state.
+- ❌ **Not process-plane isolation** — it re-imports the *same* `attestation.projector` module
+  in-process. It is not an independent re-implementation, which is a genuinely different (and
+  later) property.
+- ❌ **Not classification** — reproducibility says nothing about whether a field is in the *right*
+  block. A stranger recomputes a projector-computed value identically, so this test passes on a
+  misclassified field. Class is enforced separately (`derived.*` keys may not appear in
+  `attested.*`; see the seals). The structural closure — populating `attested.*` only via a reader
+  that records each field's source artifact and JSON pointer, with the schema requiring that
+  provenance — is a **named follow-up increment**.
+
+### Placeholder policy: `attested.*` and `declared.*` are deliberately opposite
+
+- **`attested.*` — never emit a placeholder.** Anything unverifiable does not belong in the block
+  at all; a `null` there would be a slot pretending to be evidence.
+- **`declared.*` — always emit**, with `value: null`, `evidenced_by_record: false`, and a note.
+  The block exists to *name* what is not evidenced; omitting defeats it and leaves a reader unable
+  to tell "inapplicable" from "unavailable".
 
 ## Verify walkthrough
 
@@ -86,6 +114,10 @@ behavioural_ok {
   att := input.attestations[_]
   att.predicateType == "https://gated.dev/attestations/behavioural-verification/v0.1"
   att.subject[_].digest.sha256 == input.artifact.sha256
+  # keying on the digest ALONE is the collision case — two cells of one task share an artifact
+  # digest with possibly different verdicts. Pin the cell too:
+  att.subject[_].name == input.cell_id                 # or: att.predicate.statement_id == ...
+  att.predicate.attested.cell.reviewer_lineage == input.reviewer_lineage
   att.predicate.derived.merge_effect.value == "allowed"
   att.predicate.declared.calibration_state.value == "ENABLED"   # NOTE: declared, not attested
 }
@@ -115,6 +147,7 @@ is trusting the operator, not the record. The field path says so.
 ## Board #2 (the true negative) is attested too
 
 Board #2's review column refused entirely; its **gate** cells still produced real verdicts, so
-Statements are emitted — each carrying `attested.board_status: review_column_refused` and a
-`scope.does_not_attest` entry for any board-level claim. Emitting the honest failure is the test of
-the projector, not an exception to it.
+Statements are emitted — each carrying `derived.board_status: review_column_refused` (a projector
+computation, with its recipe — *not* a measured field) and a `scope.does_not_attest` entry for any
+board-level claim. Emitting the honest failure is the test of the projector, not an exception to
+it.

@@ -14,9 +14,9 @@
     },
     "attested": {
       "type": "object",
-      "description": "MEASURED tier: every field traceable to a published signed receipt or manifest.",
-      "required": ["outcome", "result_kind", "measurement", "cell", "detector_id", "code_sha", "board_status", "linkage"],
-      "additionalProperties": true,
+      "description": "MEASURED tier: every field traceable to a published signed receipt or manifest. PLACEHOLDER POLICY (differs from declared.* deliberately): NEVER emit a placeholder here — anything unverifiable does not belong in this block at all, so a null would be a slot pretending to be evidence. Compare declared.*, which ALWAYS emits (its purpose is to name what is not evidenced). additionalProperties is false because a loose schema would let a future computed field arrive in a measured slot without failing validation — that is the class law leaking.",
+      "required": ["outcome", "result_kind", "measurement", "cell", "detector_id", "code_sha", "linkage"],
+      "additionalProperties": false,
       "properties": {
         "outcome": {"type": "string", "enum": ["pass", "fail", "error"]},
         "result_kind": {
@@ -55,10 +55,6 @@
         "gated_commit": {"type": "string"},
         "preregistered_at": {"type": "string"},
         "denominator": {"type": "object"},
-        "board_status": {
-          "type": "string",
-          "enum": ["review_column_complete", "partial_error", "review_column_refused"]
-        },
         "linkage": {
           "type": "object",
           "required": ["board_id", "manifest_digest", "receipt_digest", "sealed_run_path"],
@@ -75,7 +71,7 @@
     },
     "declared": {
       "type": "object",
-      "description": "OPERATOR-ASSERTED tier: NOT evidenced by the published record, so NOT stranger-reproducible. Excluded from the stranger-simulation comparison by construction.",
+      "description": "OPERATOR-ASSERTED tier: NOT evidenced by the published record, so NOT stranger-reproducible. Excluded from the stranger-simulation comparison by construction. PLACEHOLDER POLICY: ALWAYS emit each field (null value + evidenced_by_record:false + note) — omitting would hide the residual and leave a reader unable to distinguish 'inapplicable' from 'unavailable'. This is the OPPOSITE of attested.*, deliberately.",
       "additionalProperties": {
         "type": "object",
         "required": ["value", "evidenced_by_record", "note"],
