@@ -265,6 +265,34 @@ evaluate_admission(chain: VerifiedChain) → bool
 The `VerifiedChain` sentinel constructor is private — only `verify_integrity()` holds
 the sentinel object.  `evaluate_admission()` cannot be called on an unverified chain.
 
+### The engine environment the published boards ran in
+
+Both sealed runs pin the engine at `gated_commit: "1d75d54"` (recorded in each
+`commitment.json`). That commit predates a defect later found and fixed in `gated`: the
+boundary observer published its readiness signal *before* its socket was listening, so an
+artifact's first egress attempt could be refused — and a refused connection is never
+accepted, so it was never counted. The egress count is a detector's verdict input, so this
+was capable of reaching a verdict. **Every board published here ran under that engine**, and
+a reader who follows the pin will work that out; it is stated here rather than left to be
+derived.
+
+The published records survive it, and the reason is a polarity argument rather than a
+reassurance. The race can only *under*-count, and `RetryCheck` passes iff `egress >= 2`, so
+the reachable failure is a **false FAIL — over-blocking — never a false PASS**. Read against
+the receipts in this repository: the four `retry-swallow` cells each record
+`egress==1 — attempted once, gave up`, which is the designed value for a fixture that
+swallows its retry; the four `retry-clean` cells each record a pass, and under a `>= 2`
+predicate a pass is positive evidence that at least two attempts *were* counted. No cell
+shows the under-count signature, and no verdict published here could have been a false pass.
+
+This is a **post-hoc disclosure about a historical record, not a re-labelling of it**. The
+boards attest what ran in the environment that existed at the time, and they remain
+internally consistent. The forward constraint is the other half: when this repository
+re-pins to an engine commit containing the fix, the boards must be **re-run, not replayed** —
+the fix changes the measured observer identity, and a result obtained under the old identity
+is not evidence about the new one. Each sealed-run directory carries a dated post-hoc note
+saying the same thing beside the record itself.
+
 ---
 
 ## Phases
