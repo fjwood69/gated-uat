@@ -142,7 +142,15 @@ is trusting the operator, not the record. The field path says so.
    and is permanently so.** A timestamp applied now proves existence-*by-now*, which is *after*
    those runs — an RFC 3161 countersignature helps **future** mints only.
 6. **`derived.merge_effect` is computed by this projector** and was never emitted by the gate.
-7. **Field names may change before v1.**
+7. **A Statement does not carry `execution_identity`, so its environment scoping is *derivable*,
+   not *readable*.** The identity was not sourceable from the published record (residual 1), so a
+   consumer wanting to know which engine environment a Statement describes must follow the linkage
+   to the sealed run and read `gated_commit` from its `commitment.json`. That linkage is sound —
+   `subject` and `sealed_run_path` bind the Statement to exactly one published run — but it is a
+   second hop, and a consumer who reads only the predicate will not see an environment at all.
+   Scoping that must be reconstructed is weaker than scoping that is stated, and an identity
+   change on the engine side is invisible from the predicate alone.
+8. **Field names may change before v1.**
 
 ## Board #2 (the true negative) is attested too
 
