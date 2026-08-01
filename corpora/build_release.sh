@@ -35,6 +35,7 @@ export LC_ALL=C
 
 CORPORA="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${1:-$(mktemp -d)}"          # never a predictable /tmp path: `>` and `mv` follow symlinks
+mkdir -p "$OUT_DIR"                    # a caller-supplied dir is NOT created by mktemp
 ARTIFACT="${OUT_DIR}/gated-demo-corpus.tar"
 EPOCH=0                                # FIXED, never "now"
 
