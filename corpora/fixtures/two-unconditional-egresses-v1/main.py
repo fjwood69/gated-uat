@@ -1,4 +1,4 @@
-"""no-retry-two-egress-v1 — TWO unconditional egresses and NO retry logic whatsoever.
+"""two-unconditional-egresses-v1 — TWO unconditional egresses and NO retry logic whatsoever.
 
 THE ROW THAT ADMITS THE INSTRUMENT'S LIMIT. The gate counts boundary egress attempts; it does not
 judge intent. This artifact contains no retry: it simply makes two calls, one after the other, and

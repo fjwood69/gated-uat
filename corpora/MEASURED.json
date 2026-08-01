@@ -1,0 +1,12 @@
+{
+  "egress_counts": {
+    "retry-good-v2": 3,
+    "retry-swallow-v2": 1,
+    "retry-swallow-v2-mutated-behavioural": 3,
+    "retry-swallow-v2-mutated-cosmetic": 1,
+    "two-unconditional-egresses-v1": 2
+  },
+  "format_version": 1,
+  "note": "Counts ONLY. The ADMIT/BLOCK rule is DEMO POLICY for these fixtures and is deliberately absent from this file; a consumer computes verdicts from these counts and its own policy.",
+  "witness_condition": "persistent 503 from the sealed-network witness"
+}
